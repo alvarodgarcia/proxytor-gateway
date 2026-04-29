@@ -8,6 +8,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/proxytor-api
+EnvironmentFile=-/etc/default/proxytor-telegram
 ExecStart=/opt/proxytor-api/venv/bin/python /opt/proxytor-api/telegram_token_bot.py
 Restart=always
 RestartSec=5

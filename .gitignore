@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+
+# Runtime data
+*.db
+*.sqlite
+*.sqlite3
+proxytor.db
+*.log
+
+# Secrets / local config
+.env
+*.env
+*.secret
+*.key
+*.pem
+config.json
+proxytor-telegram
+token
+token.viewer
+token.previous
+token.viewer.previous
+
+# Backups / archives
+*.bak
+*.backup
+backup_*/
+*.tgz
+*.tar.gz
+*.zip
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,5 +1,5 @@
 [Unit]
-Description=Rotate ProxyTor API token every 24 hours
+Description=Rotate ProxyTor admin token every 24 hours
 
 [Timer]
 OnBootSec=10min
