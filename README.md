@@ -9,6 +9,24 @@ Review and adapt the configuration before using it in production.
 
 ---
 
+## Important: NPMplus is optional
+
+ProxyTor Gateway does **not** require NPMplus, Nginx Proxy Manager or any reverse proxy.
+
+It works standalone with direct LAN/VPN access:
+
+| Service | Endpoint |
+|---|---|
+| Dashboard/API | `http://PROXYTOR_IP:8088/` |
+| Privoxy HTTP proxy | `http://PROXYTOR_IP:8118` |
+| Tor SOCKS5 proxy | `PROXYTOR_IP:9050` |
+
+A reverse proxy is optional and only needed if you want to expose the dashboard/API over HTTPS using your own domain.
+
+Do **not** expose `9050/tcp` or `8118/tcp` directly to the Internet.
+
+---
+
 ## Key Features
 
 - Tor SOCKS5 proxy gateway.
@@ -25,7 +43,8 @@ Review and adapt the configuration before using it in production.
 - Ban/unban controls from dashboard and Telegram.
 - SQLite persistence.
 - systemd service units.
-- Reverse proxy friendly deployment.
+- Standalone deployment by default.
+- Optional reverse proxy friendly deployment.
 
 ---
 
@@ -64,7 +83,7 @@ Recommended environment:
 - Privoxy.
 - SQLite.
 - iptables.
-- Optional: NPMplus or another reverse proxy.
+- Optional: reverse proxy for HTTPS dashboard access.
 - Optional: Telegram bot.
 
 ---
@@ -95,7 +114,7 @@ Recommended protections:
 | Path | Purpose |
 |---|---|
 | `config/` | Example configuration files |
-| `docs/` | Deployment, API, Telegram and security documentation |
+| `docs/` | Deployment, API, Telegram, optional reverse proxy and security documentation |
 | `proxytor_api/` | FastAPI dashboard/API |
 | `telegram_bot/` | Telegram bot integration |
 | `systemd/` | systemd unit files |
@@ -161,6 +180,10 @@ Open the dashboard:
 
 - `http://PROXYTOR_IP:8088/`
 
+Use the HTTP proxy from trusted clients:
+
+- `http://PROXYTOR_IP:8118`
+
 ---
 
 ## Configuration
@@ -181,6 +204,7 @@ Recommended default settings:
 | `abuse_detection_enabled` | `true` | Enable abuse detection |
 | `abuse_connections_per_client` | `25` | Alert threshold per client |
 | `telegram_alerts` | `true` | Enable Telegram notifications |
+| `npmplus_ips` | `[]` | Optional; only needed if using NPMplus/TCP stream in front of ProxyTor |
 
 Example placeholder values:
 
@@ -188,9 +212,8 @@ Example placeholder values:
 |---|---|
 | `PROXYTOR_IP` | ProxyTor server IP |
 | `LAN_GATEWAY_IP` | LAN gateway/router IP |
-| `NPMPLUS_IP_1` | Reverse proxy node 1 |
-| `NPMPLUS_IP_2` | Reverse proxy node 2 |
-| `NPMPLUS_VIP` | Reverse proxy virtual IP |
+| `REVERSE_PROXY_IP` | Optional reverse proxy IP |
+| `REVERSE_PROXY_VIP` | Optional reverse proxy virtual IP |
 
 ---
 
@@ -235,7 +258,19 @@ Available commands:
 
 ---
 
-## Reverse Proxy / NPMplus
+## Optional Reverse Proxy
+
+A reverse proxy is optional and only needed if you want HTTPS/dashboard access through a domain.
+
+Supported examples:
+
+- NPMplus
+- Nginx Proxy Manager
+- Nginx
+- Caddy
+- Traefik
+- Cloudflare Tunnel
+- WireGuard/Tailscale private access
 
 Recommended dashboard publishing model:
 
