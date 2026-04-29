@@ -10,13 +10,29 @@ CONFIG_DIR="/etc/proxytor-api"
 DATA_DIR="/var/lib/proxytor-api"
 BACKUP_SUFFIX="proxytor-backup-$(date +%F_%H%M%S)"
 
+detect_server_ip() {
+  local detected_ip=""
+
+  detected_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')"
+
+  if [[ -z "$detected_ip" ]]; then
+    detected_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+
+  if [[ -z "$detected_ip" ]]; then
+    detected_ip="SERVER_IP"
+  fi
+
+  echo "$detected_ip"
+}
+
 echo "[1/10] Installing packages..."
 apt update
 apt install -y \
   tor tor-geoipdb torsocks obfs4proxy proxychains \
   privoxy \
   python3 python3-venv python3-pip \
-  sqlite3 iptables curl ca-certificates jq openssl
+  sqlite3 iptables curl ca-certificates jq openssl iproute2
 
 echo "[2/10] Creating directories..."
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$INSTALL_DIR/scripts" /etc/default
@@ -80,6 +96,8 @@ systemctl restart tor@default
 systemctl restart privoxy
 systemctl restart proxytor-api
 
+SERVER_IP="$(detect_server_ip)"
+
 echo "[10/10] Done."
 echo
 echo "Admin token:"
@@ -89,7 +107,7 @@ echo "Viewer token:"
 cat "$CONFIG_DIR/token.viewer"
 echo
 echo "Open dashboard:"
-echo "http://SERVER_IP:8088/"
+echo "http://${SERVER_IP}:8088/"
 echo
 echo "Optional next steps:"
 echo "- Edit /etc/default/proxytor-telegram and enable proxytor-telegram-bot if Telegram is required."
