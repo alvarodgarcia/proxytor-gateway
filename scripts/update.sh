@@ -21,6 +21,6 @@ systemctl restart proxytor-api || true
 systemctl restart proxytor-telegram-bot || true
 
 echo "[5/5] Checking ports..."
-ss -lntup | egrep ':9050|:9051|:8118|:8088' || true
+ss -lntup | grep -E ':9050|:9051|:8118|:8088' || true
 
 echo "Update completed."
