@@ -8,8 +8,9 @@ echo "=================================================="
 INSTALL_DIR="/opt/proxytor-api"
 CONFIG_DIR="/etc/proxytor-api"
 DATA_DIR="/var/lib/proxytor-api"
+BACKUP_SUFFIX="proxytor-backup-$(date +%F_%H%M%S)"
 
-echo "[1/9] Installing packages..."
+echo "[1/10] Installing packages..."
 apt update
 apt install -y \
   tor tor-geoipdb torsocks obfs4proxy proxychains \
@@ -17,21 +18,21 @@ apt install -y \
   python3 python3-venv python3-pip \
   sqlite3 iptables curl ca-certificates jq openssl
 
-echo "[2/9] Creating directories..."
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$INSTALL_DIR/scripts"
+echo "[2/10] Creating directories..."
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$INSTALL_DIR/scripts" /etc/default
 
-echo "[3/9] Installing application files..."
+echo "[3/10] Installing application files..."
 cp proxytor_api/app.py "$INSTALL_DIR/app.py"
 cp telegram_bot/telegram_token_bot.py "$INSTALL_DIR/telegram_token_bot.py"
 cp scripts/rotate-token.sh "$INSTALL_DIR/scripts/rotate-token.sh"
 chmod +x "$INSTALL_DIR/scripts/rotate-token.sh"
 
-echo "[4/9] Creating Python virtual environment..."
+echo "[4/10] Creating Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install -r proxytor_api/requirements.txt
 
-echo "[5/9] Creating tokens..."
+echo "[5/10] Creating tokens..."
 if [[ ! -f "$CONFIG_DIR/token" ]]; then
   openssl rand -hex 32 > "$CONFIG_DIR/token"
 fi
@@ -43,7 +44,7 @@ fi
 chmod 600 "$CONFIG_DIR/token" "$CONFIG_DIR/token.viewer"
 chown root:root "$CONFIG_DIR/token" "$CONFIG_DIR/token.viewer"
 
-echo "[6/9] Installing example config if missing..."
+echo "[6/10] Installing ProxyTor configuration..."
 if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
   cp config/config.example.json "$CONFIG_DIR/config.json"
   chmod 600 "$CONFIG_DIR/config.json"
@@ -54,7 +55,18 @@ if [[ ! -f /etc/default/proxytor-telegram ]]; then
   chmod 600 /etc/default/proxytor-telegram
 fi
 
-echo "[7/9] Installing systemd services..."
+echo "[7/10] Applying Tor and Privoxy example configuration..."
+if [[ -f /etc/tor/torrc ]]; then
+  cp -a /etc/tor/torrc "/etc/tor/torrc.$BACKUP_SUFFIX"
+fi
+cp config/torrc.example /etc/tor/torrc
+
+if [[ -f /etc/privoxy/config ]]; then
+  cp -a /etc/privoxy/config "/etc/privoxy/config.$BACKUP_SUFFIX"
+fi
+cp config/privoxy.example /etc/privoxy/config
+
+echo "[8/10] Installing systemd services..."
 cp systemd/proxytor-api.service /etc/systemd/system/
 cp systemd/proxytor-telegram-bot.service /etc/systemd/system/
 cp systemd/proxytor-token-rotate.service /etc/systemd/system/ 2>/dev/null || true
@@ -62,13 +74,13 @@ cp systemd/proxytor-token-rotate.timer /etc/systemd/system/ 2>/dev/null || true
 
 systemctl daemon-reload
 
-echo "[8/9] Enabling services..."
+echo "[9/10] Enabling core services..."
 systemctl enable tor@default privoxy proxytor-api
 systemctl restart tor@default
 systemctl restart privoxy
 systemctl restart proxytor-api
 
-echo "[9/9] Done."
+echo "[10/10] Done."
 echo
 echo "Admin token:"
 cat "$CONFIG_DIR/token"
@@ -78,3 +90,8 @@ cat "$CONFIG_DIR/token.viewer"
 echo
 echo "Open dashboard:"
 echo "http://SERVER_IP:8088/"
+echo
+echo "Optional next steps:"
+echo "- Edit /etc/default/proxytor-telegram and enable proxytor-telegram-bot if Telegram is required."
+echo "- Review /etc/proxytor-api/config.json before exposing the dashboard behind a reverse proxy."
+echo "- Keep ports 9050 and 8118 restricted to trusted clients."
