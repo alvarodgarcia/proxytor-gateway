@@ -40,6 +40,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show checked out revision
+        run: |
+          git rev-parse HEAD
+          git log -1 --oneline
+          echo "--- scripts/update.sh ---"
+          nl -ba scripts/update.sh
+          echo "--- egrep search ---"
+          grep -Rni "egrep" scripts .github --exclude-dir=.git || true
+
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
