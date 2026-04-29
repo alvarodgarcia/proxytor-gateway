@@ -1,0 +1,5 @@
+SocksPort 0.0.0.0:9050 IsolateSOCKSAuth
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+ClientOnly 1
+SafeLogging 1
