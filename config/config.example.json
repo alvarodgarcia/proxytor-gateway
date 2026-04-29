@@ -1,16 +1,9 @@
 {
-  "npmplus_ips": [
-    "NPMPLUS_IP_1",
-    "NPMPLUS_IP_2",
-    "NPMPLUS_VIP"
-  ],
+  "npmplus_ips": [],
   "protected_ips": [
     "127.0.0.1",
     "LAN_GATEWAY_IP",
-    "PROXYTOR_IP",
-    "NPMPLUS_IP_1",
-    "NPMPLUS_IP_2",
-    "NPMPLUS_VIP"
+    "PROXYTOR_IP"
   ],
   "recent_minutes": 10,
   "alert_service_down": true,
