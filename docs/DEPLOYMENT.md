@@ -2,6 +2,8 @@
 
 ProxyTor Gateway is designed for Debian 12 Bookworm and can be deployed on a VM, bare-metal host or LXC/container-like environment with systemd support.
 
+ProxyTor does **not** require NPMplus or any reverse proxy to work.
+
 ## Default services and ports
 
 | Service | Port | Scope | Description |
@@ -13,7 +15,7 @@ ProxyTor Gateway is designed for Debian 12 Bookworm and can be deployed on a VM,
 
 Do not expose these ports directly to the Internet.
 
-## Basic deployment
+## Basic standalone deployment
 
 Clone the repository:
 
@@ -50,13 +52,33 @@ Read generated tokens:
 - `sudo cat /etc/proxytor-api/token`
 - `sudo cat /etc/proxytor-api/token.viewer`
 
-Open the dashboard:
+Open the dashboard directly:
 
 - `http://PROXYTOR_IP:8088/`
 
-## Reverse proxy deployment
+Use the HTTP proxy directly from trusted clients:
 
-Recommended model:
+- `http://PROXYTOR_IP:8118`
+
+Test Privoxy through Tor:
+
+- `curl -x http://127.0.0.1:8118 https://check.torproject.org/api/ip`
+
+## Optional reverse proxy deployment
+
+A reverse proxy is optional and should only be used to publish the dashboard/API over HTTPS.
+
+Supported examples include:
+
+- NPMplus
+- Nginx Proxy Manager
+- Nginx
+- Caddy
+- Traefik
+- Cloudflare Tunnel
+- VPN-only access with WireGuard or Tailscale
+
+Recommended dashboard model:
 
 | Field | Value |
 |---|---|
