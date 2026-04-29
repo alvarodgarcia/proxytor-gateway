@@ -1,0 +1,62 @@
+name: Validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate-python:
+    name: Validate Python
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f proxytor_api/requirements.txt ]; then
+            pip install -r proxytor_api/requirements.txt
+          fi
+
+      - name: Compile Python files
+        run: |
+          python -m py_compile proxytor_api/app.py
+          python -m py_compile telegram_bot/telegram_token_bot.py
+
+  validate-shell:
+    name: Validate shell scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: ShellCheck scripts
+        run: |
+          shellcheck scripts/*.sh
+
+  secret-scan-basic:
+    name: Basic secret and private value scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Search for forbidden public values
+        run: |
+          ! grep -RniE 'abgnetwork|192\.168\.1\.|Panel estilo|cebolla|sk-|hf_' . \
+            --exclude-dir=.git \
+            --exclude-dir=.github
