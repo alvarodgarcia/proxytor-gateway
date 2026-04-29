@@ -298,7 +298,7 @@ Only configured proxy ports are affected.
 | Check Privoxy | `systemctl status privoxy --no-pager` |
 | Check API | `systemctl status proxytor-api --no-pager` |
 | Check Telegram bot | `systemctl status proxytor-telegram-bot --no-pager` |
-| Check listening ports | `ss -lntup \| egrep ':9050\|:9051\|:8118\|:8088'` |
+| Check listening ports | `ss -lntup | grep -E ':9050|:9051|:8118|:8088'` |
 | Test Tor SOCKS | `curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip` |
 | Test Privoxy | `curl -x http://127.0.0.1:8118 https://check.torproject.org/api/ip` |
 | Backup | `sudo bash scripts/backup.sh` |
