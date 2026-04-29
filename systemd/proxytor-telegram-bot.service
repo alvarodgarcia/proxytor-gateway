@@ -1,0 +1,16 @@
+[Unit]
+Description=ProxyTor Telegram Bot
+After=network-online.target proxytor-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/proxytor-api
+ExecStart=/opt/proxytor-api/venv/bin/python /opt/proxytor-api/telegram_token_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate ProxyTor API token every 24 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+Persistent=true
+Unit=proxytor-token-rotate.service
+
+[Install]
+WantedBy=timers.target

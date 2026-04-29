@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate ProxyTor API token
+
+[Service]
+Type=oneshot
+ExecStart=/root/scripts/rotate_proxytor_token_daily.sh

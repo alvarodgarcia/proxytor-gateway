@@ -1,0 +1,16 @@
+[Unit]
+Description=ProxyTor API Dashboard
+After=network-online.target tor@default.service privoxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/proxytor-api
+ExecStart=/opt/proxytor-api/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
