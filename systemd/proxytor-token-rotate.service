@@ -3,4 +3,4 @@ Description=Rotate ProxyTor admin token
 
 [Service]
 Type=oneshot
-ExecStart=/root/scripts/rotate_proxytor_token_daily.sh
+ExecStart=/opt/proxytor-api/scripts/rotate-token.sh
