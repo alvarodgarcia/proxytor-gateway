@@ -11,6 +11,8 @@ ProxyTor Gateway handles sensitive operations such as proxy access, Tor control,
 | `8088/tcp` | ProxyTor API/dashboard | Protected reverse proxy, VPN or private access only |
 | `9051/tcp` | Tor ControlPort | Localhost only |
 
+NPMplus is **not required**. A reverse proxy is optional and only recommended when publishing the dashboard/API over HTTPS.
+
 ## Secrets
 
 Never commit or publish:
@@ -42,7 +44,9 @@ Viewer tokens must not be able to restart services, rotate tokens or manage bans
 
 ## Ban protection
 
-Add reverse proxy, gateway and management IPs to `protected_ips` and `npmplus_ips` to avoid accidental self-bans.
+Add gateway, management and reverse proxy IPs to `protected_ips` to avoid accidental self-bans.
+
+If you use NPMplus or another TCP stream/reverse proxy in front of ProxyTor, also add those IPs to `npmplus_ips`. Leave `npmplus_ips` empty when no NPMplus/TCP stream is used.
 
 ## Operational recommendations
 
