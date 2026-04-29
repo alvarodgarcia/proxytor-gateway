@@ -15,14 +15,16 @@ apt install -y \
   tor tor-geoipdb torsocks obfs4proxy proxychains \
   privoxy \
   python3 python3-venv python3-pip \
-  sqlite3 iptables curl ca-certificates jq
+  sqlite3 iptables curl ca-certificates jq openssl
 
 echo "[2/9] Creating directories..."
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR" "$INSTALL_DIR/scripts"
 
 echo "[3/9] Installing application files..."
 cp proxytor_api/app.py "$INSTALL_DIR/app.py"
 cp telegram_bot/telegram_token_bot.py "$INSTALL_DIR/telegram_token_bot.py"
+cp scripts/rotate-token.sh "$INSTALL_DIR/scripts/rotate-token.sh"
+chmod +x "$INSTALL_DIR/scripts/rotate-token.sh"
 
 echo "[4/9] Creating Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/venv"
@@ -39,6 +41,7 @@ if [[ ! -f "$CONFIG_DIR/token.viewer" ]]; then
 fi
 
 chmod 600 "$CONFIG_DIR/token" "$CONFIG_DIR/token.viewer"
+chown root:root "$CONFIG_DIR/token" "$CONFIG_DIR/token.viewer"
 
 echo "[6/9] Installing example config if missing..."
 if [[ ! -f "$CONFIG_DIR/config.json" ]]; then
