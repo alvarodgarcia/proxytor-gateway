@@ -538,7 +538,7 @@ def geolocate_ip(ip: str) -> dict:
 
     try:
         response = requests.get(
-            f"http://ip-api.com/json/{ip}?fields=status,country,as,isp,query",
+            f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,lat,lon,timezone,as,isp,query",
             timeout=8,
         )
         data = response.json()
@@ -548,6 +548,11 @@ def geolocate_ip(ip: str) -> dict:
 
         return {
             "country": data.get("country", ""),
+            "region": data.get("regionName", ""),
+            "city": data.get("city", ""),
+            "lat": data.get("lat", None),
+            "lon": data.get("lon", None),
+            "timezone": data.get("timezone", ""),
             "asn": data.get("as", ""),
             "isp": data.get("isp", ""),
         }
@@ -1562,18 +1567,30 @@ def dashboard():
 
         <div class="card wide">
           <div class="card-header">
-            <h2>IP salida Tor</h2>
+            <h2>Salida Tor</h2>
           </div>
-          <div id="exitTor" class="metric mono">---</div>
-          <div id="exitGeo" class="hint">---</div>
-        </div>
 
-        <div class="card wide">
-          <div class="card-header">
-            <h2>IP salida Privoxy</h2>
+          <div id="exitIp" class="metric mono">---</div>
+          <div id="exitGeo" class="hint">Geolocalización no disponible</div>
+
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+            <span id="exitTorStatus" class="badge warn">SOCKS Tor: ---</span>
+            <span id="exitPrivoxyStatus" class="badge warn">Privoxy: ---</span>
           </div>
-          <div id="exitPrivoxy" class="metric mono">---</div>
-          <div id="exitPrivoxyRaw" class="hint">---</div>
+
+          <div id="exitAsn" class="hint" style="margin-top:10px;">ASN/ISP: ---</div>
+          <div id="exitMismatch" class="hint" style="display:none;margin-top:8px;color:#f59e0b;">---</div>
+
+          <iframe
+            id="exitMap"
+            loading="lazy"
+            referrerpolicy="no-referrer"
+            style="width:100%;height:230px;border:0;border-radius:16px;margin-top:14px;display:none;background:#e5e7eb;">
+          </iframe>
+
+          <div id="exitMapUnavailable" class="hint" style="margin-top:12px;">
+            Mapa no disponible para esta IP.
+          </div>
         </div>
 
         <div class="card">
@@ -2559,6 +2576,82 @@ def dashboard():
     }
 
 
+    function updateExitCard(data) {
+      const exitData = data.exit || {};
+      const geo = exitData.geo || {};
+
+      const ip = exitData.ip || "N/D";
+      const privoxyIp = exitData.privoxy_ip || "N/D";
+
+      document.getElementById("exitIp").textContent = ip;
+
+      const locationParts = [];
+      if (geo.city) locationParts.push(geo.city);
+      if (geo.region) locationParts.push(geo.region);
+      if (geo.country) locationParts.push(geo.country);
+
+      document.getElementById("exitGeo").textContent =
+        locationParts.length ? locationParts.join(", ") : "Geolocalización no disponible";
+
+      document.getElementById("exitAsn").textContent =
+        "ASN/ISP: " + (geo.asn || "-") + " / " + (geo.isp || "-");
+
+      const torOk = exitData.is_tor === true;
+      const privoxyOk = exitData.privoxy_is_tor === true;
+
+      const torStatus = document.getElementById("exitTorStatus");
+      torStatus.className = "badge " + (torOk ? "ok" : "warn");
+      torStatus.textContent = "SOCKS Tor: " + (torOk ? "OK" : "KO");
+
+      const privoxyStatus = document.getElementById("exitPrivoxyStatus");
+      privoxyStatus.className = "badge " + (privoxyOk ? "ok" : "warn");
+      privoxyStatus.textContent = "Privoxy: " + (privoxyOk ? "OK" : "KO") + " · " + privoxyIp;
+
+      const mismatch = document.getElementById("exitMismatch");
+      if (exitData.same_exit_ip === false) {
+        mismatch.style.display = "block";
+        mismatch.textContent = "Aviso: SOCKS Tor y Privoxy no devuelven la misma IP de salida.";
+      } else {
+        mismatch.style.display = "none";
+        mismatch.textContent = "";
+      }
+
+      const lat = geo.lat;
+      const lon = geo.lon;
+      const map = document.getElementById("exitMap");
+      const unavailable = document.getElementById("exitMapUnavailable");
+
+      if (lat !== null && lat !== undefined && lon !== null && lon !== undefined) {
+        const latNum = Number(lat);
+        const lonNum = Number(lon);
+        const delta = 0.08;
+
+        if (!Number.isNaN(latNum) && !Number.isNaN(lonNum)) {
+          const bbox = [
+            lonNum - delta,
+            latNum - delta,
+            lonNum + delta,
+            latNum + delta
+          ].join(",");
+
+          map.src =
+            "https://www.openstreetmap.org/export/embed.html?bbox=" +
+            encodeURIComponent(bbox) +
+            "&layer=mapnik&marker=" +
+            encodeURIComponent(latNum + "," + lonNum);
+
+          map.style.display = "block";
+          unavailable.style.display = "none";
+          return;
+        }
+      }
+
+      map.removeAttribute("src");
+      map.style.display = "none";
+      unavailable.style.display = "block";
+    }
+
+
     async function loadStats() {
       const data = await apiGet("/api/stats");
 
@@ -2574,19 +2667,7 @@ def dashboard():
       document.getElementById("torVersion").textContent =
         data.tor.version ? "Versión: " + data.tor.version : data.tor.control_error || "---";
 
-      const torIp = data.exit_ip_tor || {};
-      document.getElementById("exitTor").textContent = torIp.IP || "N/D";
-
-      const geo = data.exit_geo || {};
-      document.getElementById("exitGeo").textContent =
-        (torIp.IsTor === true ? "IsTor: true" : "IsTor: N/D") +
-        (geo.country ? " · " + geo.country : "") +
-        (geo.asn ? " · " + geo.asn : "");
-
-      const privoxyIp = data.exit_ip_privoxy || {};
-      document.getElementById("exitPrivoxy").textContent = privoxyIp.IP || "N/D";
-      document.getElementById("exitPrivoxyRaw").textContent =
-        privoxyIp.IsTor === true ? "IsTor: true" : JSON.stringify(privoxyIp);
+      updateExitCard(data);
 
       document.getElementById("circuits").textContent =
         (data.tor.circuits_built ?? 0) + " / " + (data.tor.circuits_total ?? 0);
@@ -2836,6 +2917,15 @@ def stats(authorization: Optional[str] = Header(default=None)):
 
     store_exit_ips(exit_tor, exit_privoxy, geo)
 
+    exit_status = {
+        "ip": exit_tor.get("IP", ""),
+        "is_tor": exit_tor.get("IsTor", False),
+        "privoxy_ip": exit_privoxy.get("IP", ""),
+        "privoxy_is_tor": exit_privoxy.get("IsTor", False),
+        "same_exit_ip": exit_tor.get("IP", "") == exit_privoxy.get("IP", ""),
+        "geo": geo,
+    }
+
     payload = {
         "system": {
             "hostname": socket.gethostname(),
@@ -2854,6 +2944,7 @@ def stats(authorization: Optional[str] = Header(default=None)):
             "8118_privoxy": port_open("127.0.0.1", 8118),
         },
         "tor": tor_info,
+        "exit": exit_status,
         "exit_ip_tor": exit_tor,
         "exit_ip_privoxy": exit_privoxy,
         "exit_geo": geo,
