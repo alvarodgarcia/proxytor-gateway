@@ -15,6 +15,22 @@ Review and adapt the configuration before using it in production.
 
 ---
 
+## Dashboard Preview
+
+<p align="center">
+  <a href="docs/SCREENSHOTS.md">
+    <img src="docs/screenshots/dashboard-overview.png" alt="ProxyTor Gateway dashboard overview" width="950">
+  </a>
+</p>
+
+<p align="center">
+  <a href="docs/SCREENSHOTS.md"><strong>View full dashboard screenshot gallery →</strong></a>
+</p>
+
+ProxyTor Gateway includes a web dashboard for monitoring Tor, Privoxy, active clients, traffic, audit events, bans and operational actions from a single interface.
+
+---
+
 ## Important: NPMplus is optional
 
 ProxyTor Gateway does **not** require NPMplus, Nginx Proxy Manager or any reverse proxy.
@@ -380,14 +396,6 @@ Recommended default:
 | Setting | Value |
 |---|---|
 | `alert_exit_ip_change` | `false` |
-
----
-
-## Screenshots
-
-A sanitized screenshot gallery is available here:
-
-[View ProxyTor Gateway screenshots](docs/SCREENSHOTS.md)
 
 ---
 
