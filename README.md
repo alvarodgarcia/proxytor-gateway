@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="docs/SCREENSHOTS.md">
+    <img src="docs/screenshots/dashboard-overview.png" alt="ProxyTor Gateway dashboard overview" width="900">
+  </a>
+</p>
+
 # ProxyTor Gateway
 
 **ProxyTor Gateway** is a self-hosted Tor and Privoxy proxy gateway with a web dashboard, Telegram integration, token-based access control, traffic visibility, audit export, abuse detection and client ban management.
