@@ -7,6 +7,7 @@ DATA_DIR="${DATA_DIR:-/var/lib/proxytor-api}"
 DEFAULT_DIR="/etc/default"
 BACKUP_ROOT="${BACKUP_ROOT:-/root/proxytor-install-backups}"
 BACKUP_DIR="$BACKUP_ROOT/$(date +%F_%H%M%S)"
+LOG_FILE="${LOG_FILE:-/var/log/proxytor-install.log}"
 
 FORCE_CONFIG="false"
 DRY_RUN="false"
@@ -63,6 +64,10 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "ERROR: this installer must be run as root." >&2
   exit 1
 fi
+
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Track whether Tor/Privoxy configuration existed before package installation.
 # Debian packages create default config files during apt install; those should not
@@ -189,6 +194,90 @@ detect_server_ip() {
   echo "$detected_ip"
 }
 
+print_final_summary() {
+  local server_ip
+  server_ip="$(detect_server_ip)"
+
+  echo
+  echo "=================================================="
+  echo " ProxyTor Gateway installation summary"
+  echo "=================================================="
+  echo
+  echo "Dashboard:"
+  echo "  http://${server_ip}:8088/"
+  echo
+  echo "Proxy endpoints:"
+  echo "  Privoxy HTTP proxy : http://${server_ip}:8118"
+  echo "  Tor SOCKS5 proxy   : ${server_ip}:9050"
+  echo
+  echo "Local service checks:"
+  echo "  systemctl status tor@default --no-pager"
+  echo "  systemctl status privoxy --no-pager"
+  echo "  systemctl status proxytor-api --no-pager"
+  echo
+  echo "Logs:"
+  echo "  Installer : $LOG_FILE"
+  echo "  API       : journalctl -u proxytor-api -n 120 --no-pager"
+  echo "  Tor       : journalctl -u tor@default -n 120 --no-pager"
+  echo "  Privoxy   : journalctl -u privoxy -n 120 --no-pager"
+  echo
+
+  echo "Admin token:"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "  [dry-run] $CONFIG_DIR/token"
+  elif [[ -f "$CONFIG_DIR/token" ]]; then
+    cat "$CONFIG_DIR/token"
+  else
+    echo "  Not available yet: $CONFIG_DIR/token"
+  fi
+
+  echo
+  echo "Viewer token:"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "  [dry-run] $CONFIG_DIR/token.viewer"
+  elif [[ -f "$CONFIG_DIR/token.viewer" ]]; then
+    cat "$CONFIG_DIR/token.viewer"
+  else
+    echo "  Not available yet: $CONFIG_DIR/token.viewer"
+  fi
+
+  echo
+  echo "Optional admin token auto-rotation:"
+  echo "  sudo systemctl enable --now proxytor-token-rotate.timer"
+  echo "  systemctl list-timers | grep proxytor"
+  echo "  systemctl status proxytor-token-rotate.timer --no-pager"
+  echo "  sudo /opt/proxytor-api/scripts/rotate-token.sh"
+  echo "  sudo systemctl disable --now proxytor-token-rotate.timer"
+  echo
+  echo "Note: automatic rotation only affects the admin token. Viewer token rotation remains manual."
+}
+
+on_install_error() {
+  local exit_code="$?"
+
+  echo
+  echo "==================================================" >&2
+  echo " ProxyTor Gateway installer failed" >&2
+  echo "==================================================" >&2
+  echo "Exit code: $exit_code" >&2
+  echo "Installer log: $LOG_FILE" >&2
+  echo
+
+  systemctl status tor@default --no-pager >&2 || true
+  systemctl status privoxy --no-pager >&2 || true
+  systemctl status proxytor-api --no-pager >&2 || true
+
+  echo
+  echo "Recent ProxyTor API logs:" >&2
+  journalctl -u proxytor-api -n 120 --no-pager >&2 || true
+
+  print_final_summary || true
+
+  exit "$exit_code"
+}
+
+trap on_install_error ERR
+
 validate_tor_config() {
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "[dry-run] runuser -u debian-tor -- tor --verify-config -f /etc/tor/torrc"
@@ -215,21 +304,39 @@ validate_privoxy_config() {
   fi
 }
 
-require_listening_port() {
+wait_for_listening_port() {
   local port="$1"
   local name="$2"
+  local retries="${3:-30}"
+  local delay="${4:-1}"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] verify $name is listening on port $port"
+    echo "[dry-run] wait for $name to listen on port $port"
     return 0
   fi
 
-  if ! ss -lntH | awk '{print $4}' | grep -Eq "(:|\])${port}$"; then
-    echo "ERROR: $name is not listening on port $port" >&2
-    echo "Current listening proxy ports:" >&2
-    ss -lntp | grep -E ':9050|:9051|:8118|:8088' >&2 || true
-    exit 1
+  for _ in $(seq 1 "$retries"); do
+    if ss -lntH | awk '{print $4}' | grep -Eq "(:|\])${port}$"; then
+      echo "$name is listening on port $port"
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  echo "ERROR: $name is not listening on port $port after ${retries}s" >&2
+  echo "Current listening proxy ports:" >&2
+  ss -lntp | grep -E ':9050|:9051|:8118|:8088' >&2 || true
+
+  if [[ "$name" == "ProxyTor API" ]]; then
+    echo
+    echo "ProxyTor API service status:" >&2
+    systemctl status proxytor-api --no-pager >&2 || true
+    echo
+    echo "ProxyTor API recent logs:" >&2
+    journalctl -u proxytor-api -n 80 --no-pager >&2 || true
   fi
+
+  return 1
 }
 
 echo "[1/10] Installing packages..."
@@ -322,36 +429,16 @@ run systemctl restart tor@default
 run systemctl restart privoxy
 run systemctl restart proxytor-api
 
-require_listening_port 9050 "Tor SOCKS"
-require_listening_port 9051 "Tor ControlPort"
-require_listening_port 8118 "Privoxy"
-require_listening_port 8088 "ProxyTor API"
+wait_for_listening_port 9050 "Tor SOCKS" 30 1
+wait_for_listening_port 9051 "Tor ControlPort" 30 1
+wait_for_listening_port 8118 "Privoxy" 30 1
+wait_for_listening_port 8088 "ProxyTor API" 60 1
 
-SERVER_IP="$(detect_server_ip)"
+trap - ERR
 
-echo "[10/10] Done."
-echo
-
-echo "Admin token:"
-if [[ "$DRY_RUN" == "true" ]]; then
-  echo "[dry-run] $CONFIG_DIR/token"
-else
-  cat "$CONFIG_DIR/token"
-fi
+print_final_summary
 
 echo
-echo "Viewer token:"
-if [[ "$DRY_RUN" == "true" ]]; then
-  echo "[dry-run] $CONFIG_DIR/token.viewer"
-else
-  cat "$CONFIG_DIR/token.viewer"
-fi
-
-echo
-echo "Open dashboard:"
-echo "http://${SERVER_IP}:8088/"
-echo
-
 echo "Configuration notes:"
 echo "- Existing /etc/tor/torrc and /etc/privoxy/config are preserved by default."
 echo "- ProxyTor examples are available at:"
@@ -360,24 +447,10 @@ echo "  /etc/privoxy/config.proxytor.example"
 echo "- Use --force-config only if you explicitly want to replace Tor/Privoxy configs."
 echo "- Backups are stored under: $BACKUP_DIR"
 echo
-
 echo "Optional next steps:"
 echo "- Edit /etc/default/proxytor-telegram and enable proxytor-telegram-bot if Telegram is required."
 echo "- Review /etc/proxytor-api/config.json before exposing the dashboard behind a reverse proxy."
 echo "- Keep ports 9050 and 8118 restricted to trusted clients."
 echo
+echo "[10/10] Done."
 
-echo "Optional admin token auto-rotation:"
-echo "- Enable 24h admin token rotation:"
-echo "  sudo systemctl enable --now proxytor-token-rotate.timer"
-echo "- Check next scheduled rotation:"
-echo "  systemctl list-timers | grep proxytor"
-echo "- Check timer status:"
-echo "  systemctl status proxytor-token-rotate.timer --no-pager"
-echo "- Rotate admin token manually now:"
-echo "  sudo /opt/proxytor-api/scripts/rotate-token.sh"
-echo "- Disable automatic rotation if needed:"
-echo "  sudo systemctl disable --now proxytor-token-rotate.timer"
-echo
-
-echo "Note: automatic rotation only affects the admin token. Viewer token rotation remains manual."
