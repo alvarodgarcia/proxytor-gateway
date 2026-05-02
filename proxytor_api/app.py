@@ -74,6 +74,7 @@ DEFAULT_CONFIG = {
     "events_max_view_limit": 500,
     "events_max_rows": 5000,
     "events_export_enabled": True,
+    "device_aliases": {},
 }
 
 app = FastAPI(
@@ -686,21 +687,161 @@ def load_oui_vendor(mac: str) -> str:
     return cache.get(prefix, "")
 
 
+def normalize_mac(mac: str) -> str:
+    if not mac:
+        return ""
+
+    clean = mac.strip().lower().replace("-", ":")
+    parts = [part.zfill(2) for part in clean.split(":") if part]
+
+    if len(parts) != 6:
+        return clean
+
+    return ":".join(parts)
+
+
+def get_device_alias(ip: str, mac: str) -> dict:
+    config = read_config()
+    aliases = config.get("device_aliases", {})
+
+    if not isinstance(aliases, dict):
+        return {}
+
+    normalized_mac = normalize_mac(mac)
+
+    candidates = [
+        ip,
+        normalized_mac,
+        normalized_mac.upper(),
+        mac,
+        mac.upper() if mac else "",
+    ]
+
+    for candidate in candidates:
+        if candidate and candidate in aliases:
+            alias = aliases.get(candidate, {})
+            if isinstance(alias, dict):
+                return alias
+            return {"name": str(alias)}
+
+    return {}
+
+
+def guess_usage_type(client: dict) -> str:
+    privoxy_connections = int(client.get("privoxy_connections", 0) or 0)
+    tor_socks_connections = int(client.get("tor_socks_connections", 0) or 0)
+
+    if privoxy_connections > 0 and tor_socks_connections > 0:
+        return "Privoxy + SOCKS"
+
+    if privoxy_connections > 0:
+        return "HTTP proxy / Privoxy"
+
+    if tor_socks_connections > 0:
+        return "SOCKS5 / Tor"
+
+    return ""
+
+
+def guess_device_confidence(hostname: str, vendor: str, device_type: str, alias: dict) -> str:
+    if alias:
+        return "alta"
+
+    value = f"{hostname} {vendor} {device_type}".lower()
+
+    if hostname and device_type != "Desconocido":
+        return "media"
+
+    if any(item in value for item in [
+        "apple", "samsung", "xiaomi", "huawei", "mikrotik",
+        "intel", "realtek", "wistron", "liteon", "lite-on",
+        "foxconn", "hon hai", "compal", "quanta", "azurewave",
+        "dell", "lenovo", "hewlett", "hp", "asus", "acer",
+        "microsoft", "raspberry", "espressif", "tuya", "sonoff"
+    ]):
+        return "media"
+
+    if device_type != "Desconocido":
+        return "baja"
+
+    return "baja"
+
+
 def guess_device_type(hostname: str, vendor: str, ip: str) -> str:
     value = f"{hostname} {vendor}".lower()
 
-    if "iphone" in value or "ipad" in value or "apple" in value or "macbook" in value:
+    if ip.startswith("127."):
+        return "Localhost"
+
+    if "iphone" in value or "ipad" in value:
+        return "Apple / iOS"
+    if "macbook" in value or "imac" in value or "macos" in value:
+        return "Apple / macOS"
+    if "apple" in value:
         return "Apple / iOS/macOS"
-    if "android" in value or "xiaomi" in value or "samsung" in value or "huawei" in value:
+
+    if "android" in value:
         return "Android"
-    if "windows" in value or "pc" in value or "desktop" in value:
+    if "samsung" in value:
+        return "Android / Samsung"
+    if "xiaomi" in value or "redmi" in value or "poco" in value:
+        return "Android / Xiaomi"
+    if "huawei" in value or "honor" in value:
+        return "Android / Huawei"
+
+    if "windows" in value or "desktop" in value:
         return "PC Windows"
     if "linux" in value or "debian" in value or "ubuntu" in value:
         return "Linux"
+
     if "mikrotik" in value or "router" in value or "gateway" in value:
         return "Router/Firewall"
-    if ip.startswith("127."):
-        return "Localhost"
+
+    # OEM / NIC vendors commonly seen in laptops and PCs.
+    if any(item in value for item in [
+        "wistron",
+        "liteon",
+        "lite-on",
+        "foxconn",
+        "hon hai",
+        "compal",
+        "quanta",
+        "azurewave",
+        "pegatron",
+        "inventec",
+        "intel",
+        "realtek",
+        "killer",
+        "broadcom",
+        "atheros",
+        "qualcomm",
+        "mediatek",
+    ]):
+        return "PC / Laptop"
+
+    if any(item in value for item in [
+        "dell",
+        "lenovo",
+        "hewlett",
+        "hp ",
+        "asus",
+        "acer",
+        "msi",
+        "toshiba",
+        "fujitsu",
+        "microsoft",
+    ]):
+        return "PC / Laptop"
+
+    if any(item in value for item in [
+        "raspberry",
+        "espressif",
+        "sonoff",
+        "tuya",
+        "aqara",
+        "lumi",
+    ]):
+        return "IoT / Embedded"
 
     return "Desconocido"
 
@@ -767,11 +908,37 @@ def get_client_connections():
         vendor = load_oui_vendor(mac)
         device_type = "NPMplus / Stream TCP" if entry["via_npmplus"] else guess_device_type(hostname, vendor, ip)
 
+        alias = get_device_alias(ip, mac)
+        usage_type = guess_usage_type(entry)
+
+        alias_name = alias.get("name", "") if isinstance(alias, dict) else ""
+        alias_type = alias.get("type", "") if isinstance(alias, dict) else ""
+        alias_usage = alias.get("usage", "") if isinstance(alias, dict) else ""
+
+        if alias_type:
+            device_type = alias_type
+
+        if alias_usage:
+            usage_type = alias_usage
+
+        confidence = guess_device_confidence(hostname, vendor, device_type, alias)
+
+        display_device_type = device_type
+        if usage_type:
+            display_device_type = f"{device_type} · {usage_type}"
+
         entry["hostname"] = hostname
         entry["mac"] = mac
         entry["vendor"] = vendor
-        entry["device_type"] = device_type
+        entry["alias"] = alias_name
+        entry["usage_type"] = usage_type
+        entry["confidence"] = confidence
+        entry["device_type"] = display_device_type
+        entry["raw_device_type"] = device_type
         entry["ports"] = sorted(list(entry["ports"]))
+
+        if alias_name:
+            entry["note"] = f"Alias manual: {alias_name}"
 
         result.append(entry)
 
