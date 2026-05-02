@@ -215,6 +215,23 @@ validate_privoxy_config() {
   fi
 }
 
+require_listening_port() {
+  local port="$1"
+  local name="$2"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] verify $name is listening on port $port"
+    return 0
+  fi
+
+  if ! ss -lntH | awk '{print $4}' | grep -Eq "(:|\])${port}$"; then
+    echo "ERROR: $name is not listening on port $port" >&2
+    echo "Current listening proxy ports:" >&2
+    ss -lntp | grep -E ':9050|:9051|:8118|:8088' >&2 || true
+    exit 1
+  fi
+}
+
 echo "[1/10] Installing packages..."
 if [[ "$SKIP_PACKAGES" == "true" ]]; then
   echo "Skipping package installation by request."
@@ -304,6 +321,11 @@ run systemctl enable tor@default privoxy proxytor-api
 run systemctl restart tor@default
 run systemctl restart privoxy
 run systemctl restart proxytor-api
+
+require_listening_port 9050 "Tor SOCKS"
+require_listening_port 9051 "Tor ControlPort"
+require_listening_port 8118 "Privoxy"
+require_listening_port 8088 "ProxyTor API"
 
 SERVER_IP="$(detect_server_ip)"
 
