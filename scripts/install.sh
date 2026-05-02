@@ -64,6 +64,20 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
+# Track whether Tor/Privoxy configuration existed before package installation.
+# Debian packages create default config files during apt install; those should not
+# be treated as user-provided pre-existing configuration on a fresh install.
+HAD_TOR_CONFIG="false"
+HAD_PRIVOXY_CONFIG="false"
+
+if [[ -f /etc/tor/torrc ]]; then
+  HAD_TOR_CONFIG="true"
+fi
+
+if [[ -f /etc/privoxy/config ]]; then
+  HAD_PRIVOXY_CONFIG="true"
+fi
+
 echo "=================================================="
 echo " ProxyTor Gateway installer"
 echo "=================================================="
@@ -246,8 +260,8 @@ echo "[7/10] Installing Tor and Privoxy configuration examples..."
 copy_example config/torrc.example /etc/tor/torrc.proxytor.example 644
 copy_example config/privoxy.example /etc/privoxy/config.proxytor.example 644
 
-if [[ ! -f /etc/tor/torrc ]]; then
-  echo "No existing Tor config found. Installing ProxyTor torrc."
+if [[ "$HAD_TOR_CONFIG" != "true" ]]; then
+  echo "No pre-existing Tor config found before package installation. Installing ProxyTor torrc."
   install_file config/torrc.example /etc/tor/torrc 644
 elif [[ "$FORCE_CONFIG" == "true" ]]; then
   echo "Replacing existing Tor config because --force-config was used."
@@ -257,8 +271,8 @@ else
   echo "ProxyTor example available at: /etc/tor/torrc.proxytor.example"
 fi
 
-if [[ ! -f /etc/privoxy/config ]]; then
-  echo "No existing Privoxy config found. Installing ProxyTor Privoxy config."
+if [[ "$HAD_PRIVOXY_CONFIG" != "true" ]]; then
+  echo "No pre-existing Privoxy config found before package installation. Installing ProxyTor Privoxy config."
   install_file config/privoxy.example /etc/privoxy/config 644
 elif [[ "$FORCE_CONFIG" == "true" ]]; then
   echo "Replacing existing Privoxy config because --force-config was used."
