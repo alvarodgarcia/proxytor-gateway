@@ -18,5 +18,15 @@
   "events_max_view_limit": 500,
   "events_max_rows": 5000,
   "events_export_enabled": true,
-  "ban_ports": [9050, 8118]
+  "ban_ports": [
+    9050,
+    8118
+  ],
+  "device_aliases": {
+    "CLIENT_IP_OR_MAC": {
+      "name": "Example trusted client",
+      "type": "PC / Laptop",
+      "usage": "HTTP proxy / Privoxy"
+    }
+  }
 }
