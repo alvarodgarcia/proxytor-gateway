@@ -474,10 +474,10 @@ Current focus:
 Recently completed:
 
 - More robust installer idempotency.
+- Dashboard screenshots.
 
 Planned improvements:
 
-- Dashboard screenshots.
 - GitHub Actions linting.
 - Release packaging.
 - Docker/LXC examples.
