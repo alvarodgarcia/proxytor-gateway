@@ -151,6 +151,7 @@ Expected structure:
 - `docs/TELEGRAM.md`
 - `docs/NPMPLUS.md`
 - `docs/API.md`
+- `docs/LXC.md`
 - `proxytor_api/app.py`
 - `proxytor_api/requirements.txt`
 - `telegram_bot/telegram_token_bot.py`
@@ -478,10 +479,10 @@ Recently completed:
 - GitHub Actions linting.
 - Release packaging.
 - Better device fingerprinting.
+- Docker/LXC examples.
 
 Planned improvements:
 
-- Docker/LXC examples.
 - Optional nftables backend.
 - Optional allowlist mode.
 - Dashboard configuration editor.
