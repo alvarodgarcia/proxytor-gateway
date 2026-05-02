@@ -170,12 +170,16 @@ Expected structure:
 
 Clone the repository:
 
-- `git clone https://github.com/alvarodgarcia/proxytor-gateway.git`
-- `cd proxytor-gateway`
+```bash
+git clone https://github.com/alvarodgarcia/proxytor-gateway.git
+cd proxytor-gateway
+```
 
 Run the installer:
 
-- `sudo bash scripts/install.sh`
+```bash
+sudo bash scripts/install.sh
+```
 
 The installer will:
 
@@ -183,22 +187,77 @@ The installer will:
 - Create `/opt/proxytor-api`.
 - Create `/etc/proxytor-api`.
 - Create `/var/lib/proxytor-api`.
-- Generate admin and viewer tokens.
-- Install systemd services.
+- Generate admin and viewer tokens if they do not already exist.
+- Install application files and systemd services.
 - Start the API service.
+
+### Safer re-run behaviour
+
+The installer is designed to be safe to re-run on an existing installation.
+
+By default it preserves:
+
+- Existing admin and viewer tokens.
+- Existing `/etc/proxytor-api/config.json`.
+- Existing `/etc/default/proxytor-telegram`.
+- Existing `/etc/tor/torrc`.
+- Existing `/etc/privoxy/config`.
+
+ProxyTor example configurations are copied separately to:
+
+| File | Purpose |
+|---|---|
+| `/etc/tor/torrc.proxytor.example` | ProxyTor Tor example configuration |
+| `/etc/privoxy/config.proxytor.example` | ProxyTor Privoxy example configuration |
+
+Backups of replaced files are stored under:
+
+```text
+/root/proxytor-install-backups/
+```
+
+### Installer options
+
+| Option | Purpose |
+|---|---|
+| `--dry-run` | Show what would be done without changing files or restarting services |
+| `--skip-packages` | Skip `apt update` and package installation |
+| `--force-config` | Replace existing Tor and Privoxy configuration with ProxyTor examples |
+| `--help` | Show installer help |
+
+Examples:
+
+```bash
+sudo bash scripts/install.sh --dry-run
+sudo bash scripts/install.sh --skip-packages
+sudo bash scripts/install.sh --force-config
+```
+
+Use `--force-config` only when you explicitly want the installer to replace:
+
+```text
+/etc/tor/torrc
+/etc/privoxy/config
+```
 
 After installation, retrieve the generated tokens:
 
-- Admin token: `sudo cat /etc/proxytor-api/token`
-- Viewer token: `sudo cat /etc/proxytor-api/token.viewer`
+```bash
+sudo cat /etc/proxytor-api/token
+sudo cat /etc/proxytor-api/token.viewer
+```
 
 Open the dashboard:
 
-- `http://PROXYTOR_IP:8088/`
+```text
+http://PROXYTOR_IP:8088/
+```
 
 Use the HTTP proxy from trusted clients:
 
-- `http://PROXYTOR_IP:8118`
+```text
+http://PROXYTOR_IP:8118
+```
 
 ---
 
@@ -354,6 +413,9 @@ Only configured proxy ports are affected.
 | Test Privoxy | `curl -x http://127.0.0.1:8118 https://check.torproject.org/api/ip` |
 | Backup | `sudo bash scripts/backup.sh` |
 | Update | `sudo bash scripts/update.sh` |
+| Install dry-run | `sudo bash scripts/install.sh --dry-run` |
+| Re-run without package install | `sudo bash scripts/install.sh --skip-packages` |
+| Force Tor/Privoxy config replacement | `sudo bash scripts/install.sh --force-config` |
 | Rotate admin token | `sudo bash scripts/rotate-token.sh` |
 
 ---
@@ -409,9 +471,12 @@ Current focus:
 
 ## Roadmap
 
-Planned improvements:
+Recently completed:
 
 - More robust installer idempotency.
+
+Planned improvements:
+
 - Dashboard screenshots.
 - GitHub Actions linting.
 - Release packaging.
