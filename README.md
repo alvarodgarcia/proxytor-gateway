@@ -476,10 +476,10 @@ Recently completed:
 - More robust installer idempotency.
 - Dashboard screenshots.
 - GitHub Actions linting.
+- Release packaging.
 
 Planned improvements:
 
-- Release packaging.
 - Docker/LXC examples.
 - Optional nftables backend.
 - Optional allowlist mode.
