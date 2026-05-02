@@ -477,13 +477,13 @@ Recently completed:
 - Dashboard screenshots.
 - GitHub Actions linting.
 - Release packaging.
+- Better device fingerprinting.
 
 Planned improvements:
 
 - Docker/LXC examples.
 - Optional nftables backend.
 - Optional allowlist mode.
-- Better device fingerprinting.
 - Dashboard configuration editor.
 
 ---
