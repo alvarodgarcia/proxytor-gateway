@@ -74,6 +74,7 @@ Do **not** expose `9050/tcp` or `8118/tcp` directly to the Internet.
 | SOCKS5 clients | `:9050` → Tor | Internet |
 | Operators | Browser → ProxyTor Dashboard | API `:8088` |
 | Telegram | Bot → Local API | Status, tokens, bans |
+| Privileged actions | API → Root helper socket | Logs, service control and firewall actions |
 
 ### Main Components
 
@@ -83,6 +84,7 @@ Do **not** expose `9050/tcp` or `8118/tcp` directly to the Internet.
 | Tor ControlPort | `9051/tcp` | Local-only Tor control interface |
 | Privoxy | `8118/tcp` | HTTP proxy forwarding through Tor |
 | ProxyTor API | `8088/tcp` | FastAPI dashboard and API |
+| Root Helper | Unix socket | Local-only privileged helper service |
 | SQLite | Local file | Events, clients, traffic samples and bans |
 | Telegram Bot | Outbound only | Optional operational interface |
 
@@ -123,6 +125,16 @@ Recommended protections:
 - Keep Telegram bot credentials private.
 - Never commit real tokens, internal IP addresses, production domains or private configuration.
 
+## Privilege model
+
+ProxyTor now separates the web process from privileged host actions:
+
+- `proxytor-api.service` runs as the unprivileged user `proxytor-api`
+- `proxytor-root-helper.service` runs as `root`
+- privileged actions flow through `/run/proxytor-root-helper.sock`
+
+This keeps service control, log access and firewall changes out of the FastAPI process itself while preserving the operational features of the dashboard.
+
 ---
 
 ## Repository Layout
@@ -153,9 +165,11 @@ Expected structure:
 - `docs/API.md`
 - `docs/LXC.md`
 - `proxytor_api/app.py`
+- `proxytor_api/root_helper.py`
 - `proxytor_api/requirements.txt`
 - `telegram_bot/telegram_token_bot.py`
 - `systemd/proxytor-api.service`
+- `systemd/proxytor-root-helper.service`
 - `systemd/proxytor-telegram-bot.service`
 - `systemd/proxytor-token-rotate.service`
 - `systemd/proxytor-token-rotate.timer`
@@ -188,8 +202,11 @@ The installer will:
 - Create `/opt/proxytor-api`.
 - Create `/etc/proxytor-api`.
 - Create `/var/lib/proxytor-api`.
+- Create the service user `proxytor-api`.
 - Generate admin and viewer tokens if they do not already exist.
-- Install application files and systemd services.
+- Install systemd services.
+- Start the local root-helper service used for privileged operations.
+- Start the API service.
 - Start the API service.
 
 ### Safer re-run behaviour
@@ -399,6 +416,8 @@ Ban actions are applied through a dedicated iptables chain:
 
 Only configured proxy ports are affected.
 
+If `iptables` or `nft` support is missing or restricted on the host, ProxyTor keeps the dashboard/API available and logs the firewall limitation instead of failing the full service startup.
+
 ---
 
 ## Useful Commands
@@ -407,6 +426,7 @@ Only configured proxy ports are affected.
 |---|---|
 | Check Tor | `systemctl status tor@default --no-pager` |
 | Check Privoxy | `systemctl status privoxy --no-pager` |
+| Check root helper | `systemctl status proxytor-root-helper --no-pager` |
 | Check API | `systemctl status proxytor-api --no-pager` |
 | Check Telegram bot | `systemctl status proxytor-telegram-bot --no-pager` |
 | Check listening ports | `ss -lntup | grep -E ':9050|:9051|:8118|:8088'` |

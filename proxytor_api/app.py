@@ -10,13 +10,14 @@ import sqlite3
 import secrets
 import ipaddress
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import psutil
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 from stem import Signal
 from stem.control import Controller
@@ -24,12 +25,26 @@ from stem.control import Controller
 
 BASE_DIR = Path("/etc/proxytor-api")
 DATA_DIR = Path("/var/lib/proxytor-api")
+ROOT_HELPER_SOCKET = Path("/run/proxytor-root-helper.sock")
 
 TOKEN_FILE = BASE_DIR / "token"
 VIEWER_TOKEN_FILE = BASE_DIR / "token.viewer"
 TOKEN_PREVIOUS_FILE = BASE_DIR / "token.previous"
 CONFIG_FILE = BASE_DIR / "config.json"
 DB_FILE = DATA_DIR / "proxytor.db"
+PREVIOUS_TOKEN_GRACE_SECONDS = 600
+AUTH_FAILURE_LIMIT = 10
+AUTH_FAILURE_WINDOW_SECONDS = 300
+ADMIN_ACTION_LIMIT = 20
+ADMIN_ACTION_WINDOW_SECONDS = 60
+GEOLOOKUP_URL = "https://ipwho.is/{ip}"
+GEOIP_CACHE_TTL_SECONDS = 3600
+HTTP_USER_AGENT = "ProxyTor-Gateway/3.0"
+SAFE_SUBPROCESS_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
 
 TELEGRAM_CONFIG = Path("/etc/default/proxytor-telegram")
 
@@ -46,6 +61,9 @@ EXIT_CACHE = {
 LAST_TRAFFIC_SAMPLE = None
 LAST_ALERTS = {}
 OUI_CACHE = None
+GEOIP_CACHE = {}
+RATE_LIMIT_STATE = defaultdict(deque)
+RATE_LIMIT_LOCK = threading.Lock()
 
 LOG_SERVICES = {
     "tor": "tor@default",
@@ -75,6 +93,8 @@ DEFAULT_CONFIG = {
     "events_max_rows": 5000,
     "events_export_enabled": True,
     "device_aliases": {},
+    "external_geoip_enabled": True,
+    "geoip_cache_minutes": 60,
 }
 
 app = FastAPI(
@@ -82,6 +102,53 @@ app = FastAPI(
     version="3.0.0",
     description="Dashboard para Tor + Privoxy con SQLite, clientes recientes y alertas",
 )
+
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "; ".join(
+        [
+            "default-src 'self'",
+            "base-uri 'self'",
+            "object-src 'none'",
+            "frame-ancestors 'none'",
+            "img-src 'self' data:",
+            "style-src 'self' 'unsafe-inline'",
+            "script-src 'self' 'unsafe-inline'",
+            "connect-src 'self'",
+            "frame-src 'self' https://www.openstreetmap.org",
+            "font-src 'self' data:",
+            "form-action 'self'",
+        ]
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": (
+        "accelerometer=(), autoplay=(), camera=(), display-capture=(), "
+        "fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), "
+        "microphone=(), midi=(), payment=(), usb=()"
+    ),
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
+
+@app.middleware("http")
+async def apply_security_headers(request: Request, call_next):
+    response = await call_next(request)
+
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+
+    if request.url.scheme == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+
+    if request.url.path == "/" or request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("Pragma", "no-cache")
+
+    return response
 
 
 def now_ts() -> int:
@@ -127,13 +194,342 @@ def read_viewer_token() -> str:
     return read_text_file(VIEWER_TOKEN_FILE)
 
 
+def read_previous_admin_token() -> str:
+    try:
+        if not TOKEN_PREVIOUS_FILE.exists():
+            return ""
+
+        age = now_ts() - int(TOKEN_PREVIOUS_FILE.stat().st_mtime)
+        if age > PREVIOUS_TOKEN_GRACE_SECONDS:
+            return ""
+
+        return TOKEN_PREVIOUS_FILE.read_text().strip()
+    except Exception:
+        return ""
+
+
+def get_request_ip(request: Request) -> str:
+    try:
+        if request.client and request.client.host:
+            return request.client.host
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+def run_root_helper(args: list[str], timeout: int = 20) -> dict:
+    if not ROOT_HELPER_SOCKET.exists():
+        return {
+            "cmd": "root-helper-socket " + " ".join(args),
+            "returncode": 127,
+            "stdout": "",
+            "stderr": f"Root helper socket not found: {ROOT_HELPER_SOCKET}",
+        }
+    command = args[0] if args else ""
+    payload: dict[str, object] = {"command": command}
+    index = 1
+    while index < len(args):
+        key = args[index]
+        if key.startswith("--"):
+            field = key[2:].replace("-", "_")
+            value = args[index + 1] if index + 1 < len(args) else ""
+            payload[field] = value
+            index += 2
+            continue
+        if "service" not in payload:
+            payload["service"] = key
+        elif "action" not in payload:
+            payload["action"] = key
+        elif "ip" not in payload:
+            payload["ip"] = key
+        else:
+            payload.setdefault("args", []).append(key)
+        index += 1
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(str(ROOT_HELPER_SOCKET))
+            client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            client.shutdown(socket.SHUT_WR)
+
+            chunks: list[bytes] = []
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+
+        response = json.loads(b"".join(chunks).decode("utf-8") or "{}")
+        return {
+            "cmd": "root-helper-socket " + " ".join(args),
+            "returncode": int(response.get("returncode", 1)),
+            "stdout": str(response.get("stdout", "")).strip(),
+            "stderr": str(response.get("stderr", "")).strip(),
+        }
+    except Exception as exc:
+        return {
+            "cmd": "root-helper-socket " + " ".join(args),
+            "returncode": 1,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+
+
+def _rate_limit_retry_after(
+    bucket: str,
+    key: str,
+    limit: int,
+    window_seconds: int,
+    *,
+    consume: bool,
+) -> int:
+    now = time.monotonic()
+    state_key = (bucket, key)
+
+    with RATE_LIMIT_LOCK:
+        events = RATE_LIMIT_STATE[state_key]
+        cutoff = now - window_seconds
+
+        while events and events[0] <= cutoff:
+            events.popleft()
+
+        if len(events) >= limit:
+            return max(1, int(window_seconds - (now - events[0])))
+
+        if consume:
+            events.append(now)
+
+        if not events:
+            RATE_LIMIT_STATE.pop(state_key, None)
+
+    return 0
+
+
+def enforce_auth_failure_limit(request: Request):
+    retry_after = _rate_limit_retry_after(
+        "auth-failure",
+        get_request_ip(request),
+        AUTH_FAILURE_LIMIT,
+        AUTH_FAILURE_WINDOW_SECONDS,
+        consume=False,
+    )
+
+    if retry_after:
+        log_event(
+            "warning",
+            "auth_rate_limited",
+            "Rate limit de autenticacion activado",
+            {"retry_after": retry_after},
+            source_ip=get_request_ip(request),
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiados intentos de autenticacion fallidos. Intenta mas tarde.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def register_auth_failure(request: Request):
+    _rate_limit_retry_after(
+        "auth-failure",
+        get_request_ip(request),
+        AUTH_FAILURE_LIMIT,
+        AUTH_FAILURE_WINDOW_SECONDS,
+        consume=True,
+    )
+
+
+def enforce_admin_action_limit(request: Request):
+    retry_after = _rate_limit_retry_after(
+        "admin-action",
+        get_request_ip(request),
+        ADMIN_ACTION_LIMIT,
+        ADMIN_ACTION_WINDOW_SECONDS,
+        consume=True,
+    )
+
+    if retry_after:
+        log_event(
+            "warning",
+            "admin_action_rate_limited",
+            "Rate limit de acciones administrativas activado",
+            {"retry_after": retry_after},
+            source_ip=get_request_ip(request),
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiadas acciones administrativas en poco tiempo. Intenta mas tarde.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _validate_bool(config: dict, key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if not isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{key} must be a boolean")
+    return value
+
+
+def _validate_int(
+    config: dict,
+    key: str,
+    default: int,
+    *,
+    min_value: int,
+    max_value: int,
+) -> int:
+    value = config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(status_code=400, detail=f"{key} must be an integer")
+    if value < min_value or value > max_value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{key} must be between {min_value} and {max_value}",
+        )
+    return value
+
+
+def _validate_ip_list(config: dict, key: str) -> list[str]:
+    value = config.get(key, DEFAULT_CONFIG.get(key, []))
+    if not isinstance(value, list):
+        raise HTTPException(status_code=400, detail=f"{key} must be a list")
+
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise HTTPException(
+                status_code=400, detail=f"{key} entries must be strings"
+            )
+
+        candidate = item.strip()
+        if not candidate:
+            continue
+
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            if candidate.startswith("NPMPLUS_") or candidate.endswith("_IP"):
+                normalized.append(candidate)
+                continue
+            raise HTTPException(
+                status_code=400,
+                detail=f"{key} contains an invalid IP value: {candidate}",
+            )
+
+        normalized.append(candidate)
+
+    return normalized
+
+
+def _validate_port_list(config: dict, key: str) -> list[int]:
+    value = config.get(key, ABUSE_DEFAULTS.get(key, []))
+    if not isinstance(value, list):
+        raise HTTPException(status_code=400, detail=f"{key} must be a list")
+
+    ports: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise HTTPException(
+                status_code=400, detail=f"{key} entries must be integers"
+            )
+        if item < 1 or item > 65535:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{key} contains an out-of-range port: {item}",
+            )
+        ports.append(item)
+
+    return ports
+
+
+def validate_config_payload(config: dict) -> dict:
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="Config payload must be an object")
+
+    validated = DEFAULT_CONFIG.copy()
+    validated.update(ABUSE_DEFAULTS)
+
+    validated["npmplus_ips"] = _validate_ip_list(config, "npmplus_ips")
+    validated["protected_ips"] = _validate_ip_list(config, "protected_ips")
+
+    validated["recent_minutes"] = _validate_int(
+        config, "recent_minutes", DEFAULT_CONFIG["recent_minutes"], min_value=1, max_value=1440
+    )
+    validated["alert_connection_threshold"] = _validate_int(
+        config,
+        "alert_connection_threshold",
+        DEFAULT_CONFIG["alert_connection_threshold"],
+        min_value=1,
+        max_value=100000,
+    )
+    validated["events_view_limit"] = _validate_int(
+        config,
+        "events_view_limit",
+        DEFAULT_CONFIG["events_view_limit"],
+        min_value=1,
+        max_value=500,
+    )
+    validated["events_max_view_limit"] = _validate_int(
+        config,
+        "events_max_view_limit",
+        DEFAULT_CONFIG["events_max_view_limit"],
+        min_value=1,
+        max_value=5000,
+    )
+    validated["events_max_rows"] = _validate_int(
+        config,
+        "events_max_rows",
+        DEFAULT_CONFIG["events_max_rows"],
+        min_value=100,
+        max_value=100000,
+    )
+    validated["geoip_cache_minutes"] = _validate_int(
+        config,
+        "geoip_cache_minutes",
+        DEFAULT_CONFIG["geoip_cache_minutes"],
+        min_value=1,
+        max_value=1440,
+    )
+    validated["abuse_connections_per_client"] = _validate_int(
+        config,
+        "abuse_connections_per_client",
+        ABUSE_DEFAULTS["abuse_connections_per_client"],
+        min_value=1,
+        max_value=100000,
+    )
+    validated["abuse_alert_interval_seconds"] = _validate_int(
+        config,
+        "abuse_alert_interval_seconds",
+        ABUSE_DEFAULTS["abuse_alert_interval_seconds"],
+        min_value=60,
+        max_value=86400,
+    )
+    validated["ban_ports"] = _validate_port_list(config, "ban_ports")
+
+    for key, default in {
+        "alert_service_down": DEFAULT_CONFIG["alert_service_down"],
+        "alert_exit_ip_change": DEFAULT_CONFIG["alert_exit_ip_change"],
+        "alert_new_client": DEFAULT_CONFIG["alert_new_client"],
+        "telegram_alerts": DEFAULT_CONFIG["telegram_alerts"],
+        "events_export_enabled": DEFAULT_CONFIG["events_export_enabled"],
+        "external_geoip_enabled": DEFAULT_CONFIG["external_geoip_enabled"],
+        "abuse_detection_enabled": ABUSE_DEFAULTS["abuse_detection_enabled"],
+    }.items():
+        validated[key] = _validate_bool(config, key, default)
+
+    return validated
+
+
 def read_config() -> dict:
     config = DEFAULT_CONFIG.copy()
+    config.update(ABUSE_DEFAULTS)
 
     try:
         user_config = json.loads(CONFIG_FILE.read_text())
         if isinstance(user_config, dict):
-            config.update(user_config)
+            config = validate_config_payload(user_config)
     except Exception:
         pass
 
@@ -141,8 +537,7 @@ def read_config() -> dict:
 
 
 def write_config(config: dict):
-    merged = DEFAULT_CONFIG.copy()
-    merged.update(config)
+    merged = validate_config_payload(config)
     CONFIG_FILE.write_text(json.dumps(merged, indent=2) + "\n")
     os.chmod(CONFIG_FILE, 0o600)
 
@@ -164,31 +559,45 @@ def write_new_token(path: Path, previous_path: Optional[Path] = None) -> str:
     return new_token
 
 
-def auth_role(authorization: Optional[str]) -> str:
+def auth_role_optional(authorization: Optional[str]) -> str:
     admin_token = read_current_token()
     viewer_token = read_viewer_token()
+    previous_admin_token = read_previous_admin_token()
 
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        return ""
 
     supplied = authorization.replace("Bearer ", "", 1).strip()
 
     if admin_token and secrets.compare_digest(supplied, admin_token):
         return "admin"
 
+    if previous_admin_token and secrets.compare_digest(supplied, previous_admin_token):
+        return "admin"
+
     if viewer_token and secrets.compare_digest(supplied, viewer_token):
         return "viewer"
 
-    raise HTTPException(status_code=401, detail="Unauthorized")
+    return ""
 
 
-def require_auth(authorization: Optional[str], required_role: str = "viewer") -> str:
-    role = auth_role(authorization)
+def require_auth(
+    request: Request,
+    authorization: Optional[str],
+    required_role: str = "viewer",
+) -> str:
+    role = auth_role_optional(authorization)
 
-    if required_role == "admin" and role != "admin":
-        raise HTTPException(status_code=403, detail="Admin token required")
+    if role:
+        if required_role == "admin" and role != "admin":
+            raise HTTPException(status_code=403, detail="Admin token required")
 
-    return role
+        return role
+
+    enforce_auth_failure_limit(request)
+    if not role:
+        register_auth_failure(request)
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 
@@ -344,35 +753,6 @@ def parse_env_file(path: Path) -> dict:
     return data
 
 
-def send_telegram_message(message: str):
-    config = read_config()
-
-    if not config.get("telegram_alerts", True):
-        return False
-
-    tg = parse_env_file(TELEGRAM_CONFIG)
-    bot_token = tg.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = tg.get("TELEGRAM_CHAT_ID", "")
-
-    if not bot_token or not chat_id:
-        return False
-
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=12,
-        )
-        return True
-    except Exception:
-        return False
-
-
 def maybe_alert(key: str, title: str, body: str, min_interval: int = 900):
     current = now_ts()
     last = LAST_ALERTS.get(key, 0)
@@ -404,44 +784,29 @@ def systemctl_is_active(service: str) -> bool:
         ["systemctl", "is-active", "--quiet", service],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=SAFE_SUBPROCESS_ENV,
     )
     return result.returncode == 0
 
 
 def systemctl_action(service: str, action: str):
-    result = subprocess.run(
-        ["systemctl", action, service],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-    return {
-        "service": service,
-        "action": action,
-        "returncode": result.returncode,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
-    }
+    result = run_root_helper(["service-action", service, action], timeout=35)
+    result["service"] = service
+    result["action"] = action
+    return result
 
 
 def get_journal(service: str, lines: int = 120):
     if service not in LOG_SERVICES:
         raise HTTPException(status_code=400, detail="Servicio no permitido")
 
-    unit = LOG_SERVICES[service]
-
-    result = subprocess.run(
-        ["journalctl", "-u", unit, "-n", str(lines), "--no-pager"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    lines = max(1, min(lines, 500))
+    result = run_root_helper(["logs", service, "--lines", str(lines)], timeout=25)
 
     return {
-        "service": unit,
-        "returncode": result.returncode,
-        "logs": result.stdout.strip() or result.stderr.strip(),
+        "service": LOG_SERVICES[service],
+        "returncode": result["returncode"],
+        "logs": result["stdout"] or result["stderr"],
     }
 
 
@@ -504,8 +869,10 @@ def cached_request_exit(kind: str, proxy: str):
                 "http": proxy,
                 "https": proxy,
             },
+            headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
             timeout=20,
         )
+        response.raise_for_status()
         data = response.json()
     except Exception as exc:
         data = {"error": str(exc)}
@@ -530,6 +897,10 @@ def geolocate_ip(ip: str) -> dict:
     if not ip:
         return {}
 
+    config = read_config()
+    if not config.get("external_geoip_enabled", True):
+        return {}
+
     try:
         ip_obj = ipaddress.ip_address(ip)
         if ip_obj.is_private or ip_obj.is_loopback:
@@ -537,27 +908,37 @@ def geolocate_ip(ip: str) -> dict:
     except Exception:
         return {}
 
+    ttl = max(60, int(config.get("geoip_cache_minutes", 60)) * 60)
+    cached = GEOIP_CACHE.get(ip)
+    if cached and now_ts() - int(cached.get("ts", 0)) < ttl:
+        return cached.get("data", {})
+
     try:
         response = requests.get(
-            f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,lat,lon,timezone,as,isp,query",
+            GEOLOOKUP_URL.format(ip=ip),
+            headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
             timeout=8,
         )
+        response.raise_for_status()
         data = response.json()
 
-        if data.get("status") != "success":
-            return {}
-
-        return {
-            "country": data.get("country", ""),
-            "region": data.get("regionName", ""),
-            "city": data.get("city", ""),
-            "lat": data.get("lat", None),
-            "lon": data.get("lon", None),
-            "timezone": data.get("timezone", ""),
-            "asn": data.get("as", ""),
-            "isp": data.get("isp", ""),
-        }
+        if not data.get("success", False):
+            result = {}
+        else:
+            result = {
+                "country": data.get("country", ""),
+                "region": data.get("region", ""),
+                "city": data.get("city", ""),
+                "lat": data.get("latitude", None),
+                "lon": data.get("longitude", None),
+                "timezone": (data.get("timezone") or {}).get("id", ""),
+                "asn": (data.get("connection") or {}).get("asn", ""),
+                "isp": (data.get("connection") or {}).get("isp", ""),
+            }
+        GEOIP_CACHE[ip] = {"ts": now_ts(), "data": result}
+        return result
     except Exception:
+        GEOIP_CACHE[ip] = {"ts": now_ts(), "data": {}}
         return {}
 
 
@@ -636,6 +1017,7 @@ def get_mac_from_neigh(ip: str) -> str:
             capture_output=True,
             text=True,
             timeout=3,
+            env=SAFE_SUBPROCESS_ENV,
         )
 
         parts = result.stdout.split()
@@ -1569,6 +1951,41 @@ def dashboard():
       font-weight: 700;
     }
 
+    .map-fallback {
+      margin-top: 14px;
+      padding: 18px;
+      border: 1px dashed var(--border);
+      border-radius: 16px;
+      background: linear-gradient(180deg, #f8fafc, #eef2f7);
+    }
+
+    .map-fallback-title {
+      margin: 0 0 6px;
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .map-fallback-body {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .map-fallback-link {
+      display: inline-flex;
+      margin-top: 12px;
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    .map-fallback-link:hover {
+      text-decoration: underline;
+    }
+
     
     .btn-mini {
       padding: 6px 8px;
@@ -1755,8 +2172,20 @@ def dashboard():
             style="width:100%;height:230px;border:0;border-radius:16px;margin-top:14px;display:none;background:#e5e7eb;">
           </iframe>
 
-          <div id="exitMapUnavailable" class="hint" style="margin-top:12px;">
-            Mapa no disponible para esta IP.
+          <div id="exitMapUnavailable" class="map-fallback" style="margin-top:12px;">
+            <p id="exitMapUnavailableTitle" class="map-fallback-title">Mapa no disponible</p>
+            <p id="exitMapUnavailableBody" class="map-fallback-body">
+              No hay coordenadas válidas disponibles para mostrar esta salida en el mapa.
+            </p>
+            <a
+              id="exitMapUnavailableLink"
+              class="map-fallback-link"
+              href="#"
+              target="_blank"
+              rel="noopener noreferrer"
+              style="display:none;">
+              Abrir ubicación externa
+            </a>
           </div>
         </div>
 
@@ -1976,17 +2405,23 @@ def dashboard():
     let chartDragStartX = null;
     let chartDragCurrentX = null;
     let currentRole = "viewer";
-
-    tokenInput.value = localStorage.getItem("proxytor_token") || "";
+    let currentToken = "";
 
     function saveToken() {
-      localStorage.setItem("proxytor_token", tokenInput.value.trim());
-      writeOutput("Token guardado en este navegador.");
+      currentToken = tokenInput.value.trim();
+      tokenInput.value = "";
+
+      if (!currentToken) {
+        writeOutput("Token eliminado de la sesión actual.");
+        return;
+      }
+
+      writeOutput("Token cargado solo en memoria para esta sesión del navegador.");
       loadAll();
     }
 
     function getToken() {
-      return tokenInput.value.trim() || localStorage.getItem("proxytor_token") || "";
+      return currentToken || tokenInput.value.trim() || "";
     }
 
     function headers() {
@@ -2007,7 +2442,54 @@ def dashboard():
       const state = ok === true ? "ok" : ok === false ? "bad" : "warn";
       const text = ok === true ? "OK" : ok === false ? "KO" : "N/D";
       el.className = "badge " + state;
-      el.innerHTML = '<span class="dot"></span>' + text;
+      el.replaceChildren();
+
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      el.appendChild(dot);
+      el.appendChild(document.createTextNode(text));
+    }
+
+    function clearElement(el) {
+      if (el) el.replaceChildren();
+    }
+
+    function appendTextCell(row, value, className = "") {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = value;
+      row.appendChild(td);
+      return td;
+    }
+
+    function appendEmptyRow(tbody, colspan, text) {
+      clearElement(tbody);
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = colspan;
+      td.textContent = text;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+
+    function createMiniButton(text, className, onClick) {
+      const button = document.createElement("button");
+      button.className = className;
+      button.textContent = text;
+      button.addEventListener("click", onClick);
+      return button;
+    }
+
+    function appendBanButtons(container, ip) {
+      container.appendChild(
+        createMiniButton("Ban 1h", "btn-mini danger", () => banClient(ip, 3600))
+      );
+      container.appendChild(
+        createMiniButton("Ban 24h", "btn-mini danger", () => banClient(ip, 86400))
+      );
+      container.appendChild(
+        createMiniButton("Permanente", "btn-mini danger", () => banClient(ip, 0))
+      );
     }
 
     async function apiGet(path) {
@@ -2186,11 +2668,35 @@ def dashboard():
           return;
         }
 
-        tooltip.innerHTML = `
-          <div style="font-weight:800;margin-bottom:6px;">${formatChartTime(nearest.ts)}</div>
-          <div><span style="color:#93c5fd;">●</span> ${state.labelA}: <b>${nearest.valueA}</b></div>
-          <div><span style="color:#86efac;">●</span> ${state.labelB}: <b>${nearest.valueB}</b></div>
-        `;
+        tooltip.replaceChildren();
+
+        const title = document.createElement("div");
+        title.style.fontWeight = "800";
+        title.style.marginBottom = "6px";
+        title.textContent = formatChartTime(nearest.ts);
+        tooltip.appendChild(title);
+
+        const lineA = document.createElement("div");
+        const dotA = document.createElement("span");
+        dotA.style.color = "#93c5fd";
+        dotA.textContent = "●";
+        const valueA = document.createElement("b");
+        valueA.textContent = nearest.valueA;
+        lineA.appendChild(dotA);
+        lineA.appendChild(document.createTextNode(" " + state.labelA + ": "));
+        lineA.appendChild(valueA);
+        tooltip.appendChild(lineA);
+
+        const lineB = document.createElement("div");
+        const dotB = document.createElement("span");
+        dotB.style.color = "#86efac";
+        dotB.textContent = "●";
+        const valueB = document.createElement("b");
+        valueB.textContent = nearest.valueB;
+        lineB.appendChild(dotB);
+        lineB.appendChild(document.createTextNode(" " + state.labelB + ": "));
+        lineB.appendChild(valueB);
+        tooltip.appendChild(lineB);
 
         tooltip.style.left = (event.clientX + 14) + "px";
         tooltip.style.top = (event.clientY + 14) + "px";
@@ -2473,10 +2979,10 @@ def dashboard():
     }
     function renderRecentClients(clients) {
       const tbody = document.getElementById("recentClientsTable");
-      tbody.innerHTML = "";
+      clearElement(tbody);
 
       if (!clients || clients.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10">Sin clientes recientes</td></tr>';
+        appendEmptyRow(tbody, 10, "Sin clientes recientes");
         return;
       }
 
@@ -2485,34 +2991,40 @@ def dashboard():
         const isNpmplus = c.via_npmplus ? true : false;
         const canBan = currentRole === "admin" && ip && !isNpmplus;
 
-        const actions = canBan ? `
-          <button class="btn-mini danger" onclick="banClient('${ip}', 3600)">Ban 1h</button>
-          <button class="btn-mini danger" onclick="banClient('${ip}', 86400)">Ban 24h</button>
-          <button class="btn-mini danger" onclick="banClient('${ip}', 0)">Permanente</button>
-        ` : (currentRole === "admin" && isNpmplus ? "Protegido" : "Solo lectura");
-
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td class="mono">${ip}</td>
-          <td>${c.hostname || "-"}</td>
-          <td>${c.device_type || "Desconocido"}</td>
-          <td class="mono">${c.mac || "-"}</td>
-          <td>${c.vendor || "-"}</td>
-          <td>${c.last_service || "-"}</td>
-          <td>${c.last_seen_text || "-"}</td>
-          <td><b>${c.total_observations || 0}</b></td>
-          <td>${isNpmplus ? "Sí" : "No"}</td>
-          <td>${actions}</td>
-        `;
+        appendTextCell(tr, ip, "mono");
+        appendTextCell(tr, c.hostname || "-");
+        appendTextCell(tr, c.device_type || "Desconocido");
+        appendTextCell(tr, c.mac || "-", "mono");
+        appendTextCell(tr, c.vendor || "-");
+        appendTextCell(tr, c.last_service || "-");
+        appendTextCell(tr, c.last_seen_text || "-");
+
+        const observations = document.createElement("td");
+        const bold = document.createElement("b");
+        bold.textContent = String(c.total_observations || 0);
+        observations.appendChild(bold);
+        tr.appendChild(observations);
+
+        appendTextCell(tr, isNpmplus ? "Sí" : "No");
+
+        const actionsTd = document.createElement("td");
+        if (canBan) {
+          appendBanButtons(actionsTd, ip);
+        } else {
+          actionsTd.textContent = currentRole === "admin" && isNpmplus ? "Protegido" : "Solo lectura";
+        }
+        tr.appendChild(actionsTd);
         tbody.appendChild(tr);
       }
     }
+
     function renderActiveClients(clients) {
       const tbody = document.getElementById("activeClientsTable");
-      tbody.innerHTML = "";
+      clearElement(tbody);
 
       if (!clients || clients.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8">Sin conexiones activas</td></tr>';
+        appendEmptyRow(tbody, 8, "Sin conexiones activas");
         return;
       }
 
@@ -2521,23 +3033,28 @@ def dashboard():
         const isNpmplus = c.via_npmplus ? true : false;
         const canBan = currentRole === "admin" && ip && !isNpmplus;
 
-        const actions = canBan ? `
-          <button class="btn-mini danger" onclick="banClient('${ip}', 3600)">Ban 1h</button>
-          <button class="btn-mini danger" onclick="banClient('${ip}', 86400)">Ban 24h</button>
-          <button class="btn-mini danger" onclick="banClient('${ip}', 0)">Permanente</button>
-        ` : (currentRole === "admin" && isNpmplus ? "Protegido" : "Solo lectura");
-
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td class="mono">${ip}</td>
-          <td>${c.hostname || "-"}</td>
-          <td>${c.device_type || "Desconocido"}</td>
-          <td>${c.tor_socks_connections || 0}</td>
-          <td>${c.privoxy_connections || 0}</td>
-          <td><b>${c.total_connections || 0}</b></td>
-          <td>${c.note || "-"}</td>
-          <td>${actions}</td>
-        `;
+        appendTextCell(tr, ip, "mono");
+        appendTextCell(tr, c.hostname || "-");
+        appendTextCell(tr, c.device_type || "Desconocido");
+        appendTextCell(tr, String(c.tor_socks_connections || 0));
+        appendTextCell(tr, String(c.privoxy_connections || 0));
+
+        const totalTd = document.createElement("td");
+        const totalBold = document.createElement("b");
+        totalBold.textContent = String(c.total_connections || 0);
+        totalTd.appendChild(totalBold);
+        tr.appendChild(totalTd);
+
+        appendTextCell(tr, c.note || "-");
+
+        const actionsTd = document.createElement("td");
+        if (canBan) {
+          appendBanButtons(actionsTd, ip);
+        } else {
+          actionsTd.textContent = currentRole === "admin" && isNpmplus ? "Protegido" : "Solo lectura";
+        }
+        tr.appendChild(actionsTd);
         tbody.appendChild(tr);
       }
     }
@@ -2545,40 +3062,25 @@ def dashboard():
 
     function renderEvents(events) {
       const tbody = document.getElementById("eventsTable");
-      tbody.innerHTML = "";
+      clearElement(tbody);
 
       if (!events || events.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5">Sin eventos</td></tr>';
+        appendEmptyRow(tbody, 5, "Sin eventos");
         return;
       }
 
       for (const e of events) {
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${e.time || ""}</td>
-          <td>${e.severity || ""}</td>
-          <td>${e.event_type || ""}</td>
-          <td>${e.message || ""}</td>
-          <td class="mono">${e.source_ip || "-"}</td>
-        `;
+        appendTextCell(tr, e.time || "");
+        appendTextCell(tr, e.severity || "");
+        appendTextCell(tr, e.event_type || "");
+        appendTextCell(tr, e.message || "");
+        appendTextCell(tr, e.source_ip || "-", "mono");
         tbody.appendChild(tr);
       }
     }
 
     function applyRoleVisibility(role) {
-      const isAdmin = role === "admin";
-
-      const actionsTitle = document.getElementById("actionsTitle");
-      const actionsCard = document.getElementById("actionsCard");
-      const rotateAdminTopButton = document.getElementById("rotateAdminTopButton");
-      const banManualControls = document.getElementById("banManualControls");
-
-      if (actionsTitle) actionsTitle.style.display = isAdmin ? "" : "none";
-      if (actionsCard) actionsCard.style.display = isAdmin ? "" : "none";
-      if (rotateAdminTopButton) rotateAdminTopButton.style.display = isAdmin ? "" : "none";
-      if (banManualControls) banManualControls.style.display = isAdmin ? "" : "none";
-    }
-    function applyRoleVisibility(role) {
       currentRole = role || "viewer";
       const isAdmin = currentRole === "admin";
 
@@ -2600,36 +3102,15 @@ def dashboard():
       }
       return true;
     }
-    function applyRoleVisibility(role) {
-      currentRole = role || "viewer";
-      const isAdmin = currentRole === "admin";
 
-      const actionsTitle = document.getElementById("actionsTitle");
-      const actionsCard = document.getElementById("actionsCard");
-      const rotateAdminTopButton = document.getElementById("rotateAdminTopButton");
-      const banManualControls = document.getElementById("banManualControls");
-
-      if (actionsTitle) actionsTitle.style.display = isAdmin ? "" : "none";
-      if (actionsCard) actionsCard.style.display = isAdmin ? "" : "none";
-      if (rotateAdminTopButton) rotateAdminTopButton.style.display = isAdmin ? "" : "none";
-      if (banManualControls) banManualControls.style.display = isAdmin ? "" : "none";
-    }
-
-    function requireAdminUi() {
-      if (currentRole !== "admin") {
-        writeOutput("Acción no permitida: el token viewer solo permite visualización.");
-        return false;
-      }
-      return true;
-    }
     function renderBans(bans) {
       const tbody = document.getElementById("bansTable");
       if (!tbody) return;
 
-      tbody.innerHTML = "";
+      clearElement(tbody);
 
       if (!bans || bans.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7">Sin bans registrados</td></tr>';
+        appendEmptyRow(tbody, 7, "Sin bans registrados");
         return;
       }
 
@@ -2637,28 +3118,34 @@ def dashboard():
         const ip = b.ip || "";
         const active = Number(b.active) === 1;
 
-        const status = active
-          ? '<span class="tag-active">Activo</span>'
-          : '<span class="tag-inactive">Inactivo</span>';
-
-        const actions = currentRole === "admin"
-          ? (active
-              ? `<button class="btn-mini success" onclick="unbanClient('${ip}')">Unban</button>`
-              : `<button class="btn-mini danger" onclick="banClient('${ip}', 3600)">Ban 1h</button>
-                 <button class="btn-mini danger" onclick="banClient('${ip}', 86400)">Ban 24h</button>
-                 <button class="btn-mini danger" onclick="banClient('${ip}', 0)">Permanente</button>`)
-          : "Solo lectura";
-
         const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td class="mono">${ip}</td>
-          <td>${status}</td>
-          <td>${b.reason || "-"}</td>
-          <td>${b.source || "-"}</td>
-          <td>${b.created_text || "-"}</td>
-          <td>${b.expires_text || "-"}</td>
-          <td>${actions}</td>
-        `;
+        appendTextCell(tr, ip, "mono");
+
+        const statusTd = document.createElement("td");
+        const statusSpan = document.createElement("span");
+        statusSpan.className = active ? "tag-active" : "tag-inactive";
+        statusSpan.textContent = active ? "Activo" : "Inactivo";
+        statusTd.appendChild(statusSpan);
+        tr.appendChild(statusTd);
+
+        appendTextCell(tr, b.reason || "-");
+        appendTextCell(tr, b.source || "-");
+        appendTextCell(tr, b.created_text || "-");
+        appendTextCell(tr, b.expires_text || "-");
+
+        const actionsTd = document.createElement("td");
+        if (currentRole === "admin") {
+          if (active) {
+            actionsTd.appendChild(
+              createMiniButton("Unban", "btn-mini success", () => unbanClient(ip))
+            );
+          } else {
+            appendBanButtons(actionsTd, ip);
+          }
+        } else {
+          actionsTd.textContent = "Solo lectura";
+        }
+        tr.appendChild(actionsTd);
         tbody.appendChild(tr);
       }
     }
@@ -2734,7 +3221,11 @@ def dashboard():
 
       const el = document.getElementById("roleBadge");
       el.className = "badge " + (isAdmin ? "ok" : "warn");
-      el.innerHTML = '<span class="dot"></span>' + role.toUpperCase();
+      el.replaceChildren();
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      el.appendChild(dot);
+      el.appendChild(document.createTextNode(role.toUpperCase()));
 
       document.getElementById("roleText").textContent =
         isAdmin ? "Acceso completo" : "Solo lectura";
@@ -2787,6 +3278,29 @@ def dashboard():
       const lon = geo.lon;
       const map = document.getElementById("exitMap");
       const unavailable = document.getElementById("exitMapUnavailable");
+      const unavailableTitle = document.getElementById("exitMapUnavailableTitle");
+      const unavailableBody = document.getElementById("exitMapUnavailableBody");
+      const unavailableLink = document.getElementById("exitMapUnavailableLink");
+
+      function setMapFallback(title, body, linkHref, linkText) {
+        map.removeAttribute("src");
+        map.style.display = "none";
+
+        unavailableTitle.textContent = title;
+        unavailableBody.textContent = body;
+
+        if (linkHref) {
+          unavailableLink.href = linkHref;
+          unavailableLink.textContent = linkText || "Abrir ubicación externa";
+          unavailableLink.style.display = "inline-flex";
+        } else {
+          unavailableLink.removeAttribute("href");
+          unavailableLink.style.display = "none";
+          unavailableLink.textContent = "";
+        }
+
+        unavailable.style.display = "block";
+      }
 
       if (lat !== null && lat !== undefined && lon !== null && lon !== undefined) {
         const latNum = Number(lat);
@@ -2813,9 +3327,30 @@ def dashboard():
         }
       }
 
-      map.removeAttribute("src");
-      map.style.display = "none";
-      unavailable.style.display = "block";
+      if (!exitData.ip || exitData.ip === "N/D") {
+        setMapFallback(
+          "Esperando IP de salida",
+          "Todavía no hay una IP pública de Tor disponible para ubicar en el mapa."
+        );
+        return;
+      }
+
+      if (locationParts.length) {
+        setMapFallback(
+          "Ubicación aproximada disponible",
+          "Se ha resuelto la zona de salida, pero no hay coordenadas válidas para incrustar el mapa.",
+          "https://www.openstreetmap.org/search?query=" + encodeURIComponent(locationParts.join(", ")),
+          "Buscar zona en OpenStreetMap"
+        );
+        return;
+      }
+
+      setMapFallback(
+        "Mapa no disponible",
+        "La IP de salida existe, pero el proveedor de geolocalización no ha devuelto coordenadas utilizables.",
+        "https://ipwho.is/" + encodeURIComponent(exitData.ip),
+        "Ver detalle externo de la IP"
+      );
     }
 
 
@@ -2984,15 +3519,12 @@ def dashboard():
 
     async function rotateToken() {
       if (!requireAdminUi()) return;
-      const ok = confirm("¿Seguro que quieres rotar el token ADMIN? El token anterior dejará de funcionar.");
+      const ok = confirm("¿Seguro que quieres rotar el token ADMIN? El token anterior seguirá funcionando durante 10 minutos.");
       if (!ok) return;
 
       try {
         const data = await apiPost("/api/action/rotate-token");
-        if (data.new_token) {
-          tokenInput.value = data.new_token;
-          localStorage.setItem("proxytor_token", data.new_token);
-        }
+        tokenInput.value = "";
         writeOutput(data);
       } catch (e) {
         writeOutput("ERROR: " + e.message);
@@ -3050,14 +3582,14 @@ def dashboard():
 
 
 @app.get("/api/me")
-def me(authorization: Optional[str] = Header(default=None)):
-    role = require_auth(authorization, "viewer")
+def me(request: Request, authorization: Optional[str] = Header(default=None)):
+    role = require_auth(request, authorization, "viewer")
     return {"role": role}
 
 
 @app.get("/api/health")
-def health(authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "viewer")
+def health(request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "viewer")
 
     return {
         "tor_service": systemctl_is_active("tor@default"),
@@ -3069,8 +3601,8 @@ def health(authorization: Optional[str] = Header(default=None)):
 
 
 @app.get("/api/stats")
-def stats(authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "viewer")
+def stats(request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "viewer")
 
     tor_info = get_tor_info()
     clients = get_client_connections()
@@ -3132,10 +3664,11 @@ def stats(authorization: Optional[str] = Header(default=None)):
 
 @app.get("/api/history")
 def history(
+    request: Request,
     hours: int = 1,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "viewer")
+    require_auth(request, authorization, "viewer")
 
     hours = max(1, min(hours, 168))
     since = now_ts() - (hours * 3600)
@@ -3156,8 +3689,8 @@ def history(
 
 
 @app.get("/api/connections")
-def connections(authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "viewer")
+def connections(request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "viewer")
 
     clients = get_client_connections()
 
@@ -3172,10 +3705,11 @@ def connections(authorization: Optional[str] = Header(default=None)):
 
 @app.get("/api/clients/recent")
 def recent_clients(
+    request: Request,
     minutes: int = 10,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "viewer")
+    require_auth(request, authorization, "viewer")
 
     minutes = max(1, min(minutes, 1440))
     since = now_ts() - (minutes * 60)
@@ -3202,10 +3736,11 @@ def recent_clients(
 
 @app.get("/api/events")
 def events(
+    request: Request,
     limit: int = 50,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "viewer")
+    require_auth(request, authorization, "viewer")
 
     limit = max(1, min(limit, 500))
 
@@ -3227,15 +3762,16 @@ def events(
 
 
 @app.get("/api/logs/{service}")
-def logs(service: str, authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "admin")
+def logs(service: str, request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "admin")
     log_event("info", "logs_read", f"Consulta de logs: {service}")
     return get_journal(service)
 
 
 @app.post("/api/action/newnym")
-def newnym(authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "admin")
+def newnym(request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
 
     try:
         before = get_exit_ip_via_tor()
@@ -3281,47 +3817,49 @@ def newnym(authorization: Optional[str] = Header(default=None)):
 
 
 @app.post("/api/action/rotate-token")
-def rotate_token(authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "admin")
+def rotate_token(request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
 
-    new_token = write_new_token(TOKEN_FILE, TOKEN_PREVIOUS_FILE)
+    write_new_token(TOKEN_FILE, TOKEN_PREVIOUS_FILE)
 
     log_event("warning", "rotate_admin_token", "Token admin rotado")
 
-    send_telegram_message(
-        "<b>ProxyTor: token admin rotado</b>\n\n"
-        f"Nuevo token:\n<code>{html.escape(new_token)}</code>"
-    )
+    send_telegram_message("<b>ProxyTor: token admin rotado</b>\n\nRecoge el nuevo token directamente del servidor.")
 
     return {
         "ok": True,
-        "message": "Token admin rotado correctamente",
-        "new_token": new_token,
+        "message": "Token admin rotado correctamente. Recoge el nuevo token en el servidor.",
+        "token_grace_seconds": PREVIOUS_TOKEN_GRACE_SECONDS,
+        "token_retrieval": f"sudo cat {TOKEN_FILE}",
     }
 
 
 @app.post("/api/action/rotate-viewer-token")
-def rotate_viewer_token(authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "admin")
+def rotate_viewer_token(request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
 
-    new_token = write_new_token(VIEWER_TOKEN_FILE, None)
+    write_new_token(VIEWER_TOKEN_FILE, None)
 
     log_event("warning", "rotate_viewer_token", "Token viewer rotado")
 
     return {
         "ok": True,
-        "message": "Token viewer rotado correctamente",
-        "new_token": new_token,
+        "message": "Token viewer rotado correctamente. Recoge el nuevo token en el servidor.",
+        "token_retrieval": f"sudo cat {VIEWER_TOKEN_FILE}",
     }
 
 
 @app.post("/api/service/{service}/{action}")
 def service_action(
+    request: Request,
     service: str,
     action: str,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "admin")
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
 
     if service not in ACTION_SERVICES:
         raise HTTPException(status_code=400, detail="Servicio no permitido")
@@ -3330,7 +3868,7 @@ def service_action(
         raise HTTPException(status_code=400, detail="Acción no permitida")
 
     unit = ACTION_SERVICES[service]
-    result = systemctl_action(unit, action)
+    result = systemctl_action(service, action)
     result["active_after"] = systemctl_is_active(unit)
 
     log_event(
@@ -3344,17 +3882,19 @@ def service_action(
 
 
 @app.get("/api/config")
-def get_config(authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization, "admin")
+def get_config(request: Request, authorization: Optional[str] = Header(default=None)):
+    require_auth(request, authorization, "admin")
     return read_config()
 
 
 @app.post("/api/config")
 def set_config(
+    request: Request,
     config: dict,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "admin")
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
     write_config(config)
     log_event("warning", "config_update", "Configuración ProxyTor actualizada", config)
     return read_config()
@@ -3413,71 +3953,23 @@ def init_abuse_db():
         conn.commit()
 
 
-def run_cmd(cmd: list) -> dict:
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-
-    return {
-        "cmd": " ".join(cmd),
-        "returncode": result.returncode,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
-    }
-
-
 def ensure_ban_chain():
     # Chain propia para no tocar reglas generales.
-    run_cmd(["iptables", "-N", "PROXYTOR_BAN"])
-
-    check = subprocess.run(
-        [
-            "iptables", "-C", "INPUT",
-            "-p", "tcp",
-            "-m", "multiport",
-            "--dports", "9050,8118",
-            "-j", "PROXYTOR_BAN"
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    if check.returncode != 0:
-        run_cmd([
-            "iptables", "-I", "INPUT", "1",
-            "-p", "tcp",
-            "-m", "multiport",
-            "--dports", "9050,8118",
-            "-j", "PROXYTOR_BAN"
-        ])
+    result = run_root_helper(["iptables-ensure-chain"], timeout=20)
+    if result["returncode"] != 0:
+        raise RuntimeError(result["stderr"] or "No se pudo preparar la chain de bans")
 
 
 def iptables_ban_ip(ip: str):
-    ensure_ban_chain()
-
-    check = subprocess.run(
-        ["iptables", "-C", "PROXYTOR_BAN", "-s", ip, "-j", "DROP"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    if check.returncode != 0:
-        run_cmd(["iptables", "-A", "PROXYTOR_BAN", "-s", ip, "-j", "DROP"])
+    result = run_root_helper(["iptables-ban-ip", ip], timeout=20)
+    if result["returncode"] != 0:
+        raise RuntimeError(result["stderr"] or f"No se pudo banear {ip}")
 
 
 def iptables_unban_ip(ip: str):
-    while True:
-        result = subprocess.run(
-            ["iptables", "-D", "PROXYTOR_BAN", "-s", ip, "-j", "DROP"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        if result.returncode != 0:
-            break
+    result = run_root_helper(["iptables-unban-ip", ip], timeout=20)
+    if result["returncode"] != 0:
+        raise RuntimeError(result["stderr"] or f"No se pudo desbanear {ip}")
 
 
 def is_ip_bannable(ip: str) -> tuple[bool, str]:
@@ -3530,6 +4022,15 @@ def ban_ip(ip: str, duration_seconds: int = 0, reason: str = "manual", source: s
     if duration_seconds and duration_seconds > 0:
         expires = created + int(duration_seconds)
 
+    try:
+        iptables_ban_ip(ip)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "ip": ip,
+            "message": f"No se pudo aplicar el ban en firewall: {exc}",
+        }
+
     with get_db() as conn:
         conn.execute(
             """
@@ -3545,8 +4046,6 @@ def ban_ip(ip: str, duration_seconds: int = 0, reason: str = "manual", source: s
             (ip, reason, created, expires, source),
         )
         conn.commit()
-
-    iptables_ban_ip(ip)
 
     log_event(
         "warning",
@@ -3579,14 +4078,21 @@ def ban_ip(ip: str, duration_seconds: int = 0, reason: str = "manual", source: s
 
 
 def unban_ip(ip: str, source: str = "manual") -> dict:
+    try:
+        iptables_unban_ip(ip)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "ip": ip,
+            "message": f"No se pudo retirar el ban en firewall: {exc}",
+        }
+
     with get_db() as conn:
         conn.execute(
             "UPDATE bans SET active = 0 WHERE ip = ?",
             (ip,),
         )
         conn.commit()
-
-    iptables_unban_ip(ip)
 
     log_event(
         "warning",
@@ -3613,6 +4119,16 @@ def unban_ip(ip: str, source: str = "manual") -> dict:
 
 def expire_old_bans():
     current = now_ts()
+
+    try:
+        ensure_ban_chain()
+    except Exception as exc:
+        log_event(
+            "warning",
+            "firewall_unavailable",
+            f"No se pudieron revisar bans expirados: {exc}",
+        )
+        return
 
     with get_db() as conn:
         rows = conn.execute(
@@ -3646,7 +4162,16 @@ def expire_old_bans():
 
 
 def apply_active_bans():
-    ensure_ban_chain()
+    try:
+        ensure_ban_chain()
+    except Exception as exc:
+        log_event(
+            "warning",
+            "firewall_unavailable",
+            f"Firewall no disponible para aplicar bans: {exc}",
+        )
+        return
+
     expire_old_bans()
 
     with get_db() as conn:
@@ -3711,11 +4236,13 @@ def send_telegram_message(message: str, reply_markup: Optional[dict] = None):
         data["reply_markup"] = json.dumps(reply_markup)
 
     try:
-        requests.post(
+        response = requests.post(
             f"https://api.telegram.org/bot{bot_token}/sendMessage",
             data=data,
+            headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
             timeout=12,
         )
+        response.raise_for_status()
         return True
     except Exception:
         return False
@@ -3856,10 +4383,11 @@ def startup_abuse_event():
 
 @app.get("/api/bans")
 def api_bans(
+    request: Request,
     active_only: bool = False,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "viewer")
+    require_auth(request, authorization, "viewer")
 
     return {
         "active_only": active_only,
@@ -3869,29 +4397,35 @@ def api_bans(
 
 @app.post("/api/action/ban/{ip}")
 def api_ban_ip(
+    request: Request,
     ip: str,
     duration_seconds: int = 0,
     reason: str = "manual",
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "admin")
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
     return ban_ip(ip, duration_seconds, reason, source="api")
 
 
 @app.post("/api/action/unban/{ip}")
 def api_unban_ip(
+    request: Request,
     ip: str,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "admin")
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
     return unban_ip(ip, source="api")
 
 
 @app.post("/api/action/ban-cleanup")
 def api_ban_cleanup(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "admin")
+    require_auth(request, authorization, "admin")
+    enforce_admin_action_limit(request)
     expire_old_bans()
     apply_active_bans()
     return {
@@ -3903,12 +4437,13 @@ def api_ban_cleanup(
 
 @app.get("/api/events/export")
 def events_export(
+    request: Request,
     date_from: str,
     date_to: str,
     format: str = "csv",
     authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization, "viewer")
+    require_auth(request, authorization, "viewer")
 
     config = read_config()
 

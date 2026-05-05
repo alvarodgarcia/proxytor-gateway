@@ -35,12 +35,19 @@ The installer creates:
 | `/var/lib/proxytor-api` | Runtime data and SQLite database |
 | `/etc/default/proxytor-telegram` | Telegram bot environment file |
 
+The installer also creates:
+
+- the unprivileged service user `proxytor-api`
+- `proxytor-api.service` for the dashboard/API
+- `proxytor-root-helper.service` for root-only local operations
+
 ## Post-installation checks
 
 Check services:
 
 - `systemctl status tor@default --no-pager`
 - `systemctl status privoxy --no-pager`
+- `systemctl status proxytor-root-helper --no-pager`
 - `systemctl status proxytor-api --no-pager`
 
 Check listening ports:
@@ -63,6 +70,16 @@ Use the HTTP proxy directly from trusted clients:
 Test Privoxy through Tor:
 
 - `curl -x http://127.0.0.1:8118 https://check.torproject.org/api/ip`
+
+## Privileged operations architecture
+
+ProxyTor uses a split-privilege model:
+
+- `proxytor-api.service` runs as `proxytor-api`
+- `proxytor-root-helper.service` runs as `root`
+- the API reaches privileged features over `/run/proxytor-root-helper.sock`
+
+This design keeps root privileges out of the web process while preserving service actions, journal access and ban management.
 
 ## Optional reverse proxy deployment
 
