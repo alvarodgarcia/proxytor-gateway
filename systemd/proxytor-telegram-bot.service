@@ -5,13 +5,26 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=proxytor-api
+Group=proxytor-api
 WorkingDirectory=/opt/proxytor-api
 EnvironmentFile=-/etc/default/proxytor-telegram
 ExecStart=/opt/proxytor-api/venv/bin/python /opt/proxytor-api/telegram_token_bot.py
 Restart=always
 RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/etc/proxytor-api /var/lib/proxytor-api /etc/default
 
 [Install]
 WantedBy=multi-user.target

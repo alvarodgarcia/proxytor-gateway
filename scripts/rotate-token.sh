@@ -19,4 +19,4 @@ chmod 600 "$TOKEN_FILE"
 chown root:root "$TOKEN_FILE"
 
 echo "ProxyTor admin token rotated."
-echo "$NEW_TOKEN"
+echo "Retrieve the new token from: $TOKEN_FILE"

@@ -1,0 +1,28 @@
+[Unit]
+Description=ProxyTor Root Helper
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/proxytor-api/venv/bin/python3 /opt/proxytor-api/root_helper.py server --socket /run/proxytor-root-helper.sock --group proxytor-api
+Restart=always
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RuntimeDirectory=proxytor
+ReadWritePaths=/run /var/lib/proxytor-api
+
+[Install]
+WantedBy=multi-user.target

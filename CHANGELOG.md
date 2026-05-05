@@ -4,6 +4,31 @@ All notable changes to ProxyTor Gateway will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows semantic versioning where possible.
 
+## [Unreleased]
+
+### Added
+
+- Local root-helper architecture for privileged operations through `proxytor-root-helper.service`.
+- Split-privilege deployment model with `proxytor-api.service` running as `proxytor-api`.
+- HTTP security headers for the dashboard/API.
+- Configurable HTTPS-based GeoIP lookup with caching controls.
+- Auth and admin-action rate limiting.
+- Map fallback states for missing or partial geolocation data.
+
+### Changed
+
+- Admin token rotation no longer exposes the new token through API responses or chat notifications.
+- Dashboard token handling now stays in browser memory instead of persistent storage.
+- Dynamic dashboard rendering now avoids unsafe HTML injection paths.
+- Firewall-dependent ban logic now degrades gracefully on hosts or containers without usable `iptables`/`nft`.
+- Installer now provisions the unprivileged service account and root-helper service.
+
+### Security
+
+- Reduced dashboard privilege from full root to a narrow local privileged helper.
+- Restricted subprocess execution environment for service, journal and firewall actions.
+- Added API-side throttling for repeated authentication failures and admin write actions.
+
 ## [v0.1.1] - 2026-05-02
 
 ### Added
