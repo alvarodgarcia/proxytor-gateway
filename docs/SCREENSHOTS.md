@@ -6,7 +6,9 @@ Sensitive values such as real IP addresses, hostnames, tokens, private domains a
 
 ## Dashboard Overview
 
-![Dashboard Overview](screenshots/dashboard-overview.png)
+![Dashboard Overview](screenshots/dashboard-overview-newnym.png)
+
+The preview shows the admin-only **Solicitar nueva salida Tor** control. IP address, geolocation, ASN/ISP and map details are sanitized.
 
 ## Traffic and Connections
 
