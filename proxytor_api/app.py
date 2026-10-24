@@ -2165,6 +2165,11 @@ def dashboard():
           <div id="exitAsn" class="hint" style="margin-top:10px;">ASN/ISP: ---</div>
           <div id="exitMismatch" class="hint" style="display:none;margin-top:8px;color:#f59e0b;">---</div>
 
+          <div id="newnymControls" style="display:none;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;">
+            <button id="newnymButton" class="success" onclick="newnym()">Solicitar nueva salida Tor</button>
+            <span id="newnymStatus" class="hint">Disponible</span>
+          </div>
+
           <iframe
             id="exitMap"
             loading="lazy"
@@ -2398,6 +2403,7 @@ def dashboard():
     const tokenInput = document.getElementById("token");
     const output = document.getElementById("output");
     let chartZoom = null;
+    let newnymCooldownTimer = null;
     let chartBaseHours = 1;
     let lastHistoryData = [];
     let isChartDragging = false;
@@ -3088,11 +3094,13 @@ def dashboard():
       const actionsCard = document.getElementById("actionsCard");
       const rotateAdminTopButton = document.getElementById("rotateAdminTopButton");
       const banManualControls = document.getElementById("banManualControls");
+      const newnymControls = document.getElementById("newnymControls");
 
       if (actionsTitle) actionsTitle.style.display = isAdmin ? "" : "none";
       if (actionsCard) actionsCard.style.display = isAdmin ? "" : "none";
       if (rotateAdminTopButton) rotateAdminTopButton.style.display = isAdmin ? "" : "none";
       if (banManualControls) banManualControls.style.display = isAdmin ? "" : "none";
+      if (newnymControls) newnymControls.style.display = isAdmin ? "flex" : "none";
     }
 
     function requireAdminUi() {
@@ -3253,6 +3261,15 @@ def dashboard():
 
       document.getElementById("exitAsn").textContent =
         "ASN/ISP: " + (geo.asn || "-") + " / " + (geo.isp || "-");
+
+      const torInfo = data.tor || {};
+      if (currentRole === "admin" && Number.isFinite(Number(torInfo.newnym_wait_seconds))) {
+        const isAvailable = torInfo.newnym_available !== false;
+        setNewnymCooldown(
+          Number(torInfo.newnym_wait_seconds),
+          isAvailable ? "Disponible" : "Tor limita temporalmente la solicitud de circuitos."
+        );
+      }
 
       const torOk = exitData.is_tor === true;
       const privoxyOk = exitData.privoxy_is_tor === true;
@@ -3506,13 +3523,75 @@ def dashboard():
       }
     }
 
+    function setNewnymCooldown(waitSeconds, message) {
+      const button = document.getElementById("newnymButton");
+      const status = document.getElementById("newnymStatus");
+      const seconds = Math.max(0, Math.ceil(Number(waitSeconds) || 0));
+      let remaining = seconds;
+
+      if (newnymCooldownTimer) {
+        clearInterval(newnymCooldownTimer);
+        newnymCooldownTimer = null;
+      }
+
+      function render() {
+        if (!button || !status) return;
+
+        if (remaining > 0) {
+          button.disabled = true;
+          button.textContent = "Nueva salida disponible en " + remaining + " s";
+          status.textContent = message || "Tor limita temporalmente la solicitud de circuitos.";
+          return;
+        }
+
+        button.disabled = false;
+        button.textContent = "Solicitar nueva salida Tor";
+        status.textContent = message || "Disponible";
+      }
+
+      render();
+      if (remaining > 0) {
+        newnymCooldownTimer = setInterval(() => {
+          remaining -= 1;
+          render();
+          if (remaining <= 0 && newnymCooldownTimer) {
+            clearInterval(newnymCooldownTimer);
+            newnymCooldownTimer = null;
+          }
+        }, 1000);
+      }
+    }
+
     async function newnym() {
       if (!requireAdminUi()) return;
+
+      const button = document.getElementById("newnymButton");
+      const status = document.getElementById("newnymStatus");
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Solicitando nueva salida…";
+      }
+      if (status) status.textContent = "Tor está creando un circuito nuevo y actualizando la salida.";
+
       try {
         const data = await apiPost("/api/action/newnym");
         writeOutput(data);
-        setTimeout(loadAll, 2500);
+
+        if (data.exit) updateExitCard({ exit: data.exit });
+
+        const waitSeconds = Number(data.wait_seconds) || 0;
+        if (data.ok) {
+          const changeMessage = data.changed === false
+            ? "Circuito solicitado. Tor puede conservar la misma IP de salida."
+            : "Circuito solicitado; IP y geolocalización actualizadas.";
+          setNewnymCooldown(waitSeconds, changeMessage);
+        } else {
+          setNewnymCooldown(waitSeconds, data.message || "NEWNYM no está disponible todavía.");
+        }
       } catch (e) {
+        if (button) button.disabled = false;
+        if (button) button.textContent = "Solicitar nueva salida Tor";
+        if (status) status.textContent = "No se pudo solicitar una nueva salida.";
         writeOutput("ERROR: " + e.message);
       }
     }
@@ -3610,20 +3689,7 @@ def stats(request: Request, authorization: Optional[str] = Header(default=None))
     update_clients_db(clients)
     sample = build_history_sample(tor_info, clients)
 
-    exit_tor = get_exit_ip_via_tor()
-    exit_privoxy = get_exit_ip_via_privoxy()
-    geo = geolocate_ip(exit_tor.get("IP", ""))
-
-    store_exit_ips(exit_tor, exit_privoxy, geo)
-
-    exit_status = {
-        "ip": exit_tor.get("IP", ""),
-        "is_tor": exit_tor.get("IsTor", False),
-        "privoxy_ip": exit_privoxy.get("IP", ""),
-        "privoxy_is_tor": exit_privoxy.get("IsTor", False),
-        "same_exit_ip": exit_tor.get("IP", "") == exit_privoxy.get("IP", ""),
-        "geo": geo,
-    }
+    exit_status = get_exit_status()
 
     payload = {
         "system": {
@@ -3644,9 +3710,12 @@ def stats(request: Request, authorization: Optional[str] = Header(default=None))
         },
         "tor": tor_info,
         "exit": exit_status,
-        "exit_ip_tor": exit_tor,
-        "exit_ip_privoxy": exit_privoxy,
-        "exit_geo": geo,
+        "exit_ip_tor": {"IP": exit_status["ip"], "IsTor": exit_status["is_tor"]},
+        "exit_ip_privoxy": {
+            "IP": exit_status["privoxy_ip"],
+            "IsTor": exit_status["privoxy_is_tor"],
+        },
+        "exit_geo": exit_status["geo"],
         "connections": {
             "active_clients": len(clients),
             "active_connections": sum(c["total_connections"] for c in clients),
@@ -3768,32 +3837,57 @@ def logs(service: str, request: Request, authorization: Optional[str] = Header(d
     return get_journal(service)
 
 
+def clear_exit_cache():
+    EXIT_CACHE["tor"] = {"ts": 0, "data": {}}
+    EXIT_CACHE["privoxy"] = {"ts": 0, "data": {}}
+
+
+def get_exit_status(force_refresh: bool = False) -> dict:
+    if force_refresh:
+        clear_exit_cache()
+
+    exit_tor = get_exit_ip_via_tor()
+    exit_privoxy = get_exit_ip_via_privoxy()
+    geo = geolocate_ip(exit_tor.get("IP", ""))
+    store_exit_ips(exit_tor, exit_privoxy, geo)
+
+    return {
+        "ip": exit_tor.get("IP", ""),
+        "is_tor": exit_tor.get("IsTor", False),
+        "privoxy_ip": exit_privoxy.get("IP", ""),
+        "privoxy_is_tor": exit_privoxy.get("IsTor", False),
+        "same_exit_ip": exit_tor.get("IP", "") == exit_privoxy.get("IP", ""),
+        "geo": geo,
+    }
+
+
 @app.post("/api/action/newnym")
 def newnym(request: Request, authorization: Optional[str] = Header(default=None)):
     require_auth(request, authorization, "admin")
     enforce_admin_action_limit(request)
 
     try:
-        before = get_exit_ip_via_tor()
+        before = get_exit_status(force_refresh=True)
 
         with tor_controller() as controller:
             available = controller.is_newnym_available()
-            wait = controller.get_newnym_wait()
+            wait = max(0, int(controller.get_newnym_wait()))
 
             if not available:
                 return {
                     "ok": False,
                     "message": "NEWNYM no disponible todavía",
                     "wait_seconds": wait,
+                    "exit": before,
                 }
 
             controller.signal(Signal.NEWNYM)
+            wait_seconds = max(0, int(controller.get_newnym_wait()))
 
-        EXIT_CACHE["tor"] = {"ts": 0, "data": {}}
-        EXIT_CACHE["privoxy"] = {"ts": 0, "data": {}}
-
+        clear_exit_cache()
         time.sleep(2)
-        after = get_exit_ip_via_tor()
+        after = get_exit_status(force_refresh=True)
+        changed = before.get("ip", "") != after.get("ip", "")
 
         log_event(
             "info",
@@ -3802,18 +3896,23 @@ def newnym(request: Request, authorization: Optional[str] = Header(default=None)
             {
                 "before": before,
                 "after": after,
+                "changed": changed,
+                "wait_seconds": wait_seconds,
             },
         )
 
         return {
             "ok": True,
             "message": "Nueva identidad solicitada a Tor",
+            "wait_seconds": wait_seconds,
+            "changed": changed,
             "before": before,
             "after": after,
+            "exit": after,
         }
 
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="No se pudo solicitar NEWNYM: " + str(exc))
 
 
 @app.post("/api/action/rotate-token")

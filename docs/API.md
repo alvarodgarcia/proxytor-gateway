@@ -35,13 +35,19 @@ curl -H "Authorization: Bearer ADMIN_TOKEN" http://127.0.0.1:8088/api/me
 | `GET` | `/api/logs/{service}` | admin | Read supported service logs |
 | `GET` | `/api/config` | admin | Read runtime configuration |
 | `POST` | `/api/config` | admin | Update runtime configuration |
-| `POST` | `/api/action/newnym` | admin | Request a new Tor circuit |
+| `POST` | `/api/action/newnym` | admin | Request a new Tor circuit; returns Tor cooldown plus refreshed exit IP/geolocation |
 | `POST` | `/api/action/rotate-token` | admin | Rotate admin token |
 | `POST` | `/api/action/rotate-viewer-token` | admin | Rotate viewer token |
 | `POST` | `/api/action/ban/{ip}` | admin | Ban a client IP |
 | `POST` | `/api/action/unban/{ip}` | admin | Remove a client ban |
 | `POST` | `/api/action/ban-cleanup` | admin | Reconcile stored bans with firewall state |
 | `POST` | `/api/service/{service}/{action}` | admin | Manage supported services |
+
+## Request a new Tor exit
+
+`POST /api/action/newnym` sends `SIGNAL NEWNYM` through Tor's authenticated local ControlPort. It requires an admin token and respects Tor's own cooldown; a successful request does not guarantee that Tor will select a different exit IP.
+
+The response includes `wait_seconds`, `changed`, and a refreshed `exit` object (IP, Tor verification, Privoxy verification and geolocation). The dashboard disables the control during this interval and refreshes the displayed exit data.
 
 ## Event export example
 
