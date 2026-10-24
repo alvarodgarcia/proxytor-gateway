@@ -13,7 +13,7 @@ Review and adapt the configuration before using it in production.
 
 <p align="center">
   <a href="docs/SCREENSHOTS.md">
-    <img src="docs/screenshots/dashboard-overview.png" alt="ProxyTor Gateway dashboard overview" width="950">
+    <img src="docs/screenshots/dashboard-overview-newnym.png" alt="ProxyTor Gateway dashboard overview" width="950">
   </a>
 </p>
 
@@ -21,7 +21,7 @@ Review and adapt the configuration before using it in production.
   <a href="docs/SCREENSHOTS.md"><strong>View full dashboard screenshot gallery →</strong></a>
 </p>
 
-ProxyTor Gateway includes a web dashboard for monitoring Tor, Privoxy, active clients, traffic, audit events, bans and operational actions from a single interface.
+ProxyTor Gateway includes a web dashboard for monitoring Tor, Privoxy, active clients, traffic, audit events, bans and operational actions from a single interface. The preview uses sanitized example data.
 
 ---
 
